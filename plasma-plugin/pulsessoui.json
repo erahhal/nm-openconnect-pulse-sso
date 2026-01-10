@@ -1,0 +1,17 @@
+{
+    "KPlugin": {
+        "Name": "Pulse SSO",
+        "Description": "Pulse VPN with browser-based SAML authentication",
+        "Authors": [
+            {
+                "Email": "github@rahh.al",
+                "Name": "Ellis Rahhal"
+            }
+        ],
+        "Category": "VPNService",
+        "EnabledByDefault": true,
+        "License": "GPL",
+        "Version": "1.0"
+    },
+    "X-NetworkManager-Services": "org.freedesktop.NetworkManager.pulse-sso"
+}

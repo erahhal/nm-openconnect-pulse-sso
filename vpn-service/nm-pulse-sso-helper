@@ -1,0 +1,391 @@
+#!/usr/bin/env python3
+"""
+NetworkManager VPN Helper Script for Pulse SSO
+
+This script is called by openconnect via --script option.
+It reads environment variables set by openconnect and reports
+the IP configuration back to our D-Bus VPN service.
+
+Environment variables from openconnect:
+- reason: why script was called (connect, disconnect, etc.)
+- VPNGATEWAY: VPN gateway address
+- TUNDEV: tunnel device name
+- INTERNAL_IP4_ADDRESS: IPv4 address
+- INTERNAL_IP4_NETMASK: IPv4 netmask
+- INTERNAL_IP4_DNS: space-separated DNS servers
+- INTERNAL_IP4_MTU: tunnel MTU
+- INTERNAL_IP6_ADDRESS: IPv6 address
+- INTERNAL_IP6_NETMASK: IPv6 netmask
+- CISCO_DEF_DOMAIN: default domain
+- CISCO_SPLIT_DNS: DNS search domains
+- CISCO_BANNER: server banner
+- CISCO_SPLIT_INC: number of split routes
+- CISCO_SPLIT_INC_%d_ADDR: route address
+- CISCO_SPLIT_INC_%d_MASKLEN: route prefix length
+"""
+
+import os
+import socket
+import struct
+import subprocess
+import sys
+
+import dbus
+
+# Path to vpnc-script - openconnect's default script for network setup
+# This will be substituted by Nix
+VPNC_SCRIPT = os.environ.get('VPNC_SCRIPT', '/etc/vpnc/vpnc-script')
+
+NM_DBUS_SERVICE = os.environ.get('NM_DBUS_SERVICE_PULSE_SSO', 'org.freedesktop.NetworkManager.pulse-sso')
+NM_DBUS_PATH = '/org/freedesktop/NetworkManager/VPN/Plugin'
+NM_DBUS_INTERFACE = 'org.freedesktop.NetworkManager.VPN.Plugin'
+
+
+def get_env(name, default=''):
+    """Get environment variable with default."""
+    return os.environ.get(name, default)
+
+
+def ip4_to_int(ip_str):
+    """Convert IPv4 address string to integer."""
+    try:
+        return struct.unpack('!I', socket.inet_aton(ip_str))[0]
+    except (socket.error, struct.error):
+        return 0
+
+
+def ip6_to_bytes(ip_str):
+    """Convert IPv6 address string to byte array for D-Bus."""
+    try:
+        return list(socket.inet_pton(socket.AF_INET6, ip_str))
+    except (socket.error, OSError):
+        return None
+
+
+def netmask_to_prefix(netmask):
+    """Convert netmask string to prefix length."""
+    try:
+        mask_int = ip4_to_int(netmask)
+        # Count leading 1 bits
+        prefix = 0
+        while mask_int & (1 << (31 - prefix)):
+            prefix += 1
+            if prefix >= 32:
+                break
+        return prefix
+    except:
+        return 32
+
+
+def parse_dns_servers(dns_str):
+    """Parse space-separated DNS server list."""
+    if not dns_str:
+        return []
+    servers = []
+    for server in dns_str.split():
+        server = server.strip()
+        if server:
+            # Convert to integer for IPv4
+            ip_int = ip4_to_int(server)
+            if ip_int:
+                servers.append(ip_int)
+    return servers
+
+
+def parse_routes():
+    """Parse CISCO_SPLIT_INC_* route variables."""
+    routes = []
+    count_str = get_env('CISCO_SPLIT_INC', '0')
+    try:
+        count = int(count_str)
+    except ValueError:
+        count = 0
+
+    for i in range(count):
+        addr = get_env(f'CISCO_SPLIT_INC_{i}_ADDR')
+        masklen_str = get_env(f'CISCO_SPLIT_INC_{i}_MASKLEN')
+
+        if addr and masklen_str:
+            try:
+                masklen = int(masklen_str)
+                addr_int = ip4_to_int(addr)
+                if addr_int:
+                    # Route format: (dest, prefix, next_hop, metric)
+                    routes.append((addr_int, masklen, 0, 0))
+            except ValueError:
+                pass
+
+    return routes
+
+
+def build_ip4_config():
+    """Build IPv4 configuration dictionary for D-Bus."""
+    config = {}
+
+    # NOTE: Gateway does NOT go in Ip4Config - it goes in SetConfig only
+    # See: https://github.com/GNOME/NetworkManager-openconnect/blob/main/src/nm-openconnect-service-openconnect-helper.c
+
+    # Internal address
+    address = get_env('INTERNAL_IP4_ADDRESS')
+    if address:
+        addr_int = ip4_to_int(address)
+        if addr_int:
+            config['address'] = dbus.UInt32(addr_int)
+            # Point-to-point address - for VPN tunnels, typically same as internal address
+            config['ptp'] = dbus.UInt32(addr_int)
+
+    # Netmask/prefix
+    netmask = get_env('INTERNAL_IP4_NETMASK')
+    if netmask:
+        config['prefix'] = dbus.UInt32(netmask_to_prefix(netmask))
+
+    # MTU
+    mtu = get_env('INTERNAL_IP4_MTU')
+    if mtu:
+        try:
+            config['mtu'] = dbus.UInt32(int(mtu))
+        except ValueError:
+            pass
+
+    # DNS servers
+    dns_str = get_env('INTERNAL_IP4_DNS')
+    dns_servers = parse_dns_servers(dns_str)
+    if dns_servers:
+        config['dns'] = dbus.Array([dbus.UInt32(s) for s in dns_servers], signature='u')
+
+    # Domain
+    domain = get_env('CISCO_DEF_DOMAIN')
+    if domain:
+        config['domain'] = domain
+
+    # DNS search domains
+    split_dns = get_env('CISCO_SPLIT_DNS')
+    if split_dns:
+        domains = [d.strip() for d in split_dns.split(',') if d.strip()]
+        if domains:
+            config['domains'] = dbus.Array(domains, signature='s')
+
+    # Routes
+    routes = parse_routes()
+    if routes:
+        # Routes as array of (u, u, u, u) - dest, prefix, next_hop, metric
+        route_array = dbus.Array([
+            dbus.Struct((dbus.UInt32(r[0]), dbus.UInt32(r[1]), dbus.UInt32(r[2]), dbus.UInt32(r[3])), signature='uuuu')
+            for r in routes
+        ], signature='(uuuu)')
+        config['routes'] = route_array
+
+        # If we have split routes, don't use as default route
+        config['never-default'] = dbus.Boolean(True)
+
+    # NOTE: Banner goes in SetConfig, not SetIp4Config
+
+    return config
+
+
+def build_ip6_config():
+    """Build IPv6 configuration dictionary for D-Bus."""
+    config = {}
+
+    address = get_env('INTERNAL_IP6_ADDRESS')
+    if not address:
+        return config
+
+    # Handle address with prefix (e.g., "2001:db8::1/64")
+    if '/' in address:
+        address, prefix_str = address.split('/', 1)
+        try:
+            prefix = int(prefix_str)
+        except ValueError:
+            prefix = 128
+    else:
+        netmask = get_env('INTERNAL_IP6_NETMASK', '128')
+        try:
+            prefix = int(netmask) if netmask else 128
+        except ValueError:
+            prefix = 128
+
+    addr_bytes = ip6_to_bytes(address)
+    if addr_bytes:
+        config['address'] = dbus.Array([dbus.Byte(b) for b in addr_bytes], signature='y')
+        config['prefix'] = dbus.UInt32(prefix)
+
+    # DNS - IPv6 DNS servers are strings, not byte arrays
+    dns_str = get_env('INTERNAL_IP6_DNS')
+    if dns_str:
+        servers = [s.strip() for s in dns_str.split() if s.strip()]
+        if servers:
+            config['dns'] = dbus.Array(servers, signature='s')
+
+    # Domain
+    domain = get_env('CISCO_DEF_DOMAIN')
+    if domain:
+        config['domain'] = domain
+
+    # Never default (same logic as IPv4 - if split routes exist)
+    if get_env('CISCO_SPLIT_INC', '0') != '0':
+        config['never-default'] = dbus.Boolean(True)
+
+    return config
+
+
+def build_config():
+    """Build general VPN configuration."""
+    config = {}
+
+    tundev = get_env('TUNDEV')
+    if tundev:
+        config['tundev'] = tundev
+    print(f"build_config: TUNDEV={tundev}", file=sys.stderr)
+
+    # Gateway must be uint32 (network byte order), not string
+    # See: https://github.com/GNOME/NetworkManager-openconnect/blob/main/src/nm-openconnect-service-openconnect-helper.c
+    gateway = get_env('VPNGATEWAY')
+    print(f"build_config: VPNGATEWAY={gateway}", file=sys.stderr)
+    if gateway:
+        # VPNGATEWAY may be IP or hostname - try to resolve
+        gateway_int = ip4_to_int(gateway)
+        if not gateway_int:
+            # Try DNS resolution
+            try:
+                resolved_ip = socket.gethostbyname(gateway)
+                gateway_int = ip4_to_int(resolved_ip)
+                print(f"build_config: Resolved {gateway} to {resolved_ip} ({gateway_int})", file=sys.stderr)
+            except socket.gaierror as e:
+                print(f"build_config: Failed to resolve {gateway}: {e}", file=sys.stderr)
+        if gateway_int:
+            config['gateway'] = dbus.UInt32(gateway_int)
+            print(f"build_config: gateway set to {gateway_int}", file=sys.stderr)
+
+    banner = get_env('CISCO_BANNER')
+    if banner:
+        config['banner'] = banner
+
+    mtu = get_env('INTERNAL_IP4_MTU')
+    if mtu:
+        try:
+            config['mtu'] = dbus.UInt32(int(mtu))
+        except ValueError:
+            pass
+
+    # Indicate we have IPv4 config
+    if get_env('INTERNAL_IP4_ADDRESS'):
+        config['has-ip4'] = dbus.Boolean(True)
+
+    # Indicate we have IPv6 config
+    if get_env('INTERNAL_IP6_ADDRESS'):
+        config['has-ip6'] = dbus.Boolean(True)
+
+    # Signal that this VPN can persist across suspend/resume
+    # NM will keep the connection alive if the connection profile also has persistent=true
+    config['can-persist'] = dbus.Boolean(True)
+
+    return config
+
+
+def call_dbus_method(method_name, config):
+    """Call a method on our VPN D-Bus service."""
+    try:
+        print(f"call_dbus_method: Connecting to {NM_DBUS_SERVICE} at {NM_DBUS_PATH}", file=sys.stderr)
+        bus = dbus.SystemBus()
+        proxy = bus.get_object(NM_DBUS_SERVICE, NM_DBUS_PATH)
+        iface = dbus.Interface(proxy, NM_DBUS_INTERFACE)
+
+        method = getattr(iface, method_name)
+        print(f"call_dbus_method: Calling {method_name}...", file=sys.stderr)
+        method(config)
+        print(f"call_dbus_method: {method_name} completed successfully", file=sys.stderr)
+        return True
+    except dbus.DBusException as e:
+        print(f"D-Bus error calling {method_name}: {e}", file=sys.stderr)
+        return False
+    except Exception as e:
+        print(f"Error calling {method_name}: {e}", file=sys.stderr)
+        return False
+
+
+def handle_connect():
+    """Handle 'connect' reason - report IP config to service."""
+    # Send general config (MUST be called before SetIp4Config)
+    config = build_config()
+    print(f"handle_connect: config={config}", file=sys.stderr)
+    if config:
+        print(f"handle_connect: Calling SetConfig", file=sys.stderr)
+        call_dbus_method('SetConfig', config)
+    else:
+        print(f"handle_connect: WARNING - config is empty!", file=sys.stderr)
+
+    # Send IPv4 config
+    ip4_config = build_ip4_config()
+    print(f"handle_connect: ip4_config keys={list(ip4_config.keys()) if ip4_config else None}", file=sys.stderr)
+    if ip4_config:
+        print(f"handle_connect: Calling SetIp4Config", file=sys.stderr)
+        call_dbus_method('SetIp4Config', ip4_config)
+
+    # Send IPv6 config
+    ip6_config = build_ip6_config()
+    print(f"handle_connect: ip6_config keys={list(ip6_config.keys()) if ip6_config else None}", file=sys.stderr)
+    if ip6_config:
+        print(f"handle_connect: Calling SetIp6Config", file=sys.stderr)
+        call_dbus_method('SetIp6Config', ip6_config)
+
+
+def handle_disconnect():
+    """Handle 'disconnect' reason."""
+    # Nothing special needed - the service handles cleanup
+    pass
+
+
+def run_vpnc_script():
+    """
+    Run vpnc-script to do the actual network setup.
+
+    This is critical - vpnc-script configures the tun device, routes, DNS, etc.
+    We call it first, then report to D-Bus.
+    """
+    if os.path.exists(VPNC_SCRIPT):
+        print(f"Running vpnc-script: {VPNC_SCRIPT}", file=sys.stderr)
+        try:
+            # vpnc-script uses environment variables set by openconnect
+            result = subprocess.run([VPNC_SCRIPT], env=os.environ)
+            print(f"vpnc-script exited with code: {result.returncode}", file=sys.stderr)
+            return result.returncode == 0
+        except Exception as e:
+            print(f"Error running vpnc-script: {e}", file=sys.stderr)
+            return False
+    else:
+        print(f"Warning: vpnc-script not found at {VPNC_SCRIPT}", file=sys.stderr)
+        return False
+
+
+def main():
+    reason = get_env('reason')
+
+    # Log for debugging
+    print(f"nm-pulse-sso-helper called with reason: {reason}", file=sys.stderr)
+
+    # FIRST: Run vpnc-script to do actual network setup
+    # This configures the tun device, routes, DNS, etc.
+    run_vpnc_script()
+
+    # THEN: Report config to D-Bus service (for NetworkManager integration)
+    if reason == 'connect':
+        handle_connect()
+    elif reason == 'disconnect':
+        handle_disconnect()
+    elif reason == 'reconnect':
+        handle_connect()
+    elif reason == 'pre-init':
+        # Nothing to do before init
+        pass
+    elif reason == 'attempt-reconnect':
+        # Nothing special for reconnect attempts
+        pass
+    else:
+        print(f"Unknown reason: {reason}", file=sys.stderr)
+
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

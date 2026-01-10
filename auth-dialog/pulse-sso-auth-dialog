@@ -1,0 +1,226 @@
+#!/usr/bin/env python3
+"""
+NetworkManager auth-dialog for Pulse SSO VPN
+
+This script is run BY NETWORKMANAGER AS THE USER when the VPN connection
+is activated. It handles browser-based SAML/SSO authentication and outputs
+the credentials to stdout for NetworkManager to pass to the VPN service.
+
+Protocol:
+- Input (stdin): DATA_KEY=x / DATA_VAL=y pairs until "DONE"
+- Output (stdout): key / value pairs (cookie, gwcert)
+- Completion: Wait for "QUIT" on stdin
+"""
+
+import argparse
+import hashlib
+import os
+import select
+import socket
+import ssl
+import subprocess
+import sys
+
+
+def get_server_cert_fingerprint(hostname: str, port: int = 443) -> str:
+    """Get SHA256 fingerprint of server certificate for certificate pinning."""
+    context = ssl.create_default_context()
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+
+    try:
+        with socket.create_connection((hostname, port), timeout=10) as sock:
+            with context.wrap_socket(sock, server_hostname=hostname) as ssock:
+                cert_der = ssock.getpeercert(binary_form=True)
+                return "sha256:" + hashlib.sha256(cert_der).hexdigest()
+    except Exception as e:
+        print(f"Warning: Could not get server certificate: {e}", file=sys.stderr)
+        return ""
+
+
+def read_vpn_details():
+    """
+    Read VPN data and secrets from stdin in NM auth-dialog format.
+
+    Format:
+        DATA_KEY=key1
+        DATA_VAL=value1
+        SECRET_KEY=key2
+        SECRET_VAL=value2
+        DONE
+
+    Returns:
+        Tuple of (data dict, secrets dict)
+    """
+    data = {}
+    secrets = {}
+
+    while True:
+        line = sys.stdin.readline()
+        if not line:
+            break
+        line = line.strip()
+
+        if line == "DONE":
+            break
+        elif line.startswith("DATA_KEY="):
+            key = line[9:]
+            val_line = sys.stdin.readline().strip()
+            if val_line.startswith("DATA_VAL="):
+                data[key] = val_line[9:]
+        elif line.startswith("SECRET_KEY="):
+            key = line[11:]
+            val_line = sys.stdin.readline().strip()
+            if val_line.startswith("SECRET_VAL="):
+                secrets[key] = val_line[11:]
+
+    return data, secrets
+
+
+def wait_for_quit(timeout: int = 20):
+    """Wait for QUIT signal from NetworkManager or timeout."""
+    while True:
+        # Use select to wait with timeout
+        readable, _, _ = select.select([sys.stdin], [], [], timeout)
+        if not readable:
+            # Timeout - exit anyway
+            break
+        line = sys.stdin.readline()
+        if not line or line.strip() == "QUIT":
+            break
+
+
+def get_dsid_via_cef(vpn_url: str, cef_binary: str, timeout: int = 300) -> str:
+    """
+    Launch CEF browser via subprocess to get DSID cookie.
+
+    Args:
+        vpn_url: Full URL to VPN endpoint
+        cef_binary: Path to pulse-browser-auth binary
+        timeout: Maximum seconds to wait
+
+    Returns:
+        DSID cookie value
+
+    Raises:
+        Exception if authentication fails or times out
+    """
+    try:
+        cmd = [cef_binary, "--url", vpn_url, "--timeout", str(timeout)]
+
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout + 10,  # Give extra time for subprocess overhead
+        )
+
+        if result.returncode != 0:
+            stderr = result.stderr.strip()
+            raise Exception(f"CEF authentication failed: {stderr}")
+
+        # Parse output - expected format: DSID=<cookie-value>
+        output = result.stdout.strip()
+        if output.startswith("DSID="):
+            return output[5:]  # Strip "DSID=" prefix
+        else:
+            raise Exception(f"Unexpected CEF output: {output}")
+
+    except subprocess.TimeoutExpired:
+        raise Exception(f"Authentication timed out after {timeout} seconds")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="NetworkManager auth-dialog for Pulse SSO VPN"
+    )
+    parser.add_argument("-u", "--uuid", help="Connection UUID")
+    parser.add_argument("-n", "--name", help="Connection name")
+    parser.add_argument("-s", "--service", help="VPN service name")
+    parser.add_argument(
+        "-i", "--interactive", action="store_true", help="Allow user interaction"
+    )
+    parser.add_argument("-r", "--reprompt", action="store_true", help="Force reprompt")
+    parser.add_argument("-t", "--hint", action="append", help="Secret hints")
+    parser.add_argument(
+        "--external-ui-mode", action="store_true", help="External UI mode"
+    )
+    parser.add_argument(
+        "--cef-binary",
+        default="/run/current-system/sw/bin/cef-pulse-auth",
+        help="Path to CEF authentication binary",
+    )
+    args = parser.parse_args()
+
+    # Read existing data/secrets from NetworkManager
+    data, secrets = read_vpn_details()
+
+    # Get gateway from connection data
+    gateway = data.get("gateway", "")
+    if not gateway:
+        print(f"Error: No gateway in connection data", file=sys.stderr)
+        sys.exit(1)
+
+    # Extract hostname for certificate fingerprint
+    hostname = gateway
+    if gateway.startswith("https://"):
+        hostname = gateway[8:]
+    elif gateway.startswith("http://"):
+        hostname = gateway[7:]
+    # Remove port if present
+    if ":" in hostname:
+        hostname = hostname.split(":")[0]
+    # Remove path if present
+    if "/" in hostname:
+        hostname = hostname.split("/")[0]
+
+    # Normalize gateway URL
+    if not gateway.startswith("http"):
+        gateway = f"https://{gateway}"
+
+    # Check if we already have a valid cookie (skip browser if so)
+    existing_cookie = secrets.get("cookie", "")
+    if existing_cookie and not args.reprompt:
+        # Output existing cookie
+        print("cookie")
+        print(existing_cookie)
+        if "gwcert" in secrets:
+            print("gwcert")
+            print(secrets["gwcert"])
+        sys.stdout.flush()
+        wait_for_quit()
+        return 0
+
+    # Need to authenticate - run CEF browser
+    try:
+        dsid_cookie = get_dsid_via_cef(
+            vpn_url=gateway,
+            cef_binary=args.cef_binary,
+            timeout=300,
+        )
+    except KeyboardInterrupt:
+        print("Authentication cancelled by user", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(f"Authentication failed: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    # Get server certificate fingerprint
+    gwcert = get_server_cert_fingerprint(hostname)
+
+    # Output secrets to stdout for NetworkManager
+    print("cookie")
+    print(dsid_cookie)
+    if gwcert:
+        print("gwcert")
+        print(gwcert)
+    sys.stdout.flush()
+
+    # Wait for NM to signal completion
+    wait_for_quit()
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,21 @@
+# NetworkManager VPN plugin descriptor for Pulse SSO
+#
+# This plugin provides browser-based SAML/SSO authentication for Pulse VPN.
+# Authentication is handled by the auth-dialog which runs AS THE USER,
+# then credentials are passed to the D-Bus service which runs openconnect.
+#
+# Note: This plugin does not have an editor component, so it won't appear
+# in nm-connection-editor's "Add VPN" dialog. Create connections via nmcli
+# or NixOS networking.networkmanager.ensureProfiles.
+
+[VPN Connection]
+name=pulse-sso
+service=org.freedesktop.NetworkManager.pulse-sso
+program=@SERVICE_BIN@
+supports-multiple-connections=false
+
+[GNOME]
+auth-dialog=@AUTH_DIALOG_BIN@
+
+[KDE]
+auth-dialog=@AUTH_DIALOG_BIN@
