@@ -81,8 +81,8 @@ run_cmd() {
 
     run_cmd "Active VPN connections" @networkmanager@/bin/nmcli connection show --active | @gnugrep@/bin/grep -i vpn || echo "No active VPN connections"
 
-    # Try to find and show VPN connection details
-    VPN_CONN=$(@networkmanager@/bin/nmcli connection show | @gnugrep@/bin/grep -i pulse | @gawk@/bin/awk '{print $1}' | head -1)
+    # Try to find and show VPN connection details (filter by TYPE, not name)
+    VPN_CONN=$(@networkmanager@/bin/nmcli -t -f NAME,TYPE connection show | @gnugrep@/bin/grep ':vpn$' | @coreutils@/bin/cut -d: -f1 | head -1 || true)
     if [ -n "$VPN_CONN" ]; then
         run_cmd "VPN connection details: $VPN_CONN" @networkmanager@/bin/nmcli connection show "$VPN_CONN"
     fi
@@ -93,11 +93,13 @@ run_cmd() {
 
     run_cmd "VPN reconnect service logs" @systemd@/bin/journalctl --since "${MINUTES} minutes ago" --no-pager -o short-precise | @gnugrep@/bin/grep -iE "vpn-reconnect" | head -50 || echo "No matching logs"
 
-    run_cmd "NetworkManager dispatcher logs" @systemd@/bin/journalctl --since "${MINUTES} minutes ago" --no-pager -o short-precise | @gnugrep@/bin/grep -iE "nm-dispatcher.*90-vpn" | head -50 || echo "No matching logs"
+    run_cmd "NetworkManager dispatcher logs" @systemd@/bin/journalctl --since "${MINUTES} minutes ago" --no-pager -o short-precise | @gnugrep@/bin/grep -iE "90-vpn-reconnect" | head -50 || echo "No matching logs"
 
     run_cmd "Suspend/resume events" @systemd@/bin/journalctl --since "${MINUTES} minutes ago" --no-pager -o short-precise | @gnugrep@/bin/grep -iE "(suspend|resume|sleep)" | head -30 || echo "No matching logs"
 
     run_cmd "NetworkManager state changes" @systemd@/bin/journalctl --since "${MINUTES} minutes ago" --no-pager -o short-precise -u NetworkManager | @gnugrep@/bin/grep -iE "(state|vpn|pulse|connect)" | head -50 || echo "No matching logs"
+
+    run_cmd "Raw journal (last 2 min, unfiltered)" @systemd@/bin/journalctl --since "2 minutes ago" --no-pager -o short-precise | head -300 || echo "No logs"
 
     section "7. CONFIGURATION"
 

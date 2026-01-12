@@ -34,7 +34,7 @@ let
   diagnose-nm-pulse-vpn = pkgs.runCommand "diagnose-nm-pulse-vpn" { } ''
     mkdir -p $out/bin
     install -m755 ${pkgs.replaceVars ./scripts/diagnose.sh {
-      inherit (pkgs) coreutils procps iproute2 gnugrep gawk systemd networkmanager dnsutils iputils nettools;
+      inherit (pkgs) coreutils procps iproute2 gnugrep systemd networkmanager dnsutils iputils nettools;
     }} $out/bin/diagnose-nm-pulse-vpn
   '';
 
@@ -57,7 +57,7 @@ let
   # NetworkManager dispatcher script
   nm-dispatcher-script = pkgs.runCommand "nm-dispatcher" { } ''
     install -Dm755 ${pkgs.replaceVars ./scripts/nm-dispatcher.sh {
-      inherit (pkgs) procps coreutils dnsutils gnugrep iproute2 gawk;
+      inherit (pkgs) procps coreutils dnsutils gnugrep iproute2 gawk networkmanager;
     }} $out
   '';
 
