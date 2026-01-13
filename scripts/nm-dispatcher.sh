@@ -55,30 +55,8 @@ if [ -z "$VPN_SERVER" ]; then
     exit 0
 fi
 
-# Resolve VPN server IP via DNS with retry
-VPN_IP=""
-for i in $(@coreutils@/bin/seq 1 30); do
-    VPN_IP=$(@dnsutils@/bin/dig +short +timeout=2 "$VPN_SERVER" 2>&1 | @gnugrep@/bin/grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -1)
-    if [ -n "$VPN_IP" ]; then
-        log_msg "Resolved VPN server $VPN_SERVER to $VPN_IP after $i attempt(s)"
-        break
-    fi
-    log_msg "DNS resolution failed for $VPN_SERVER, retrying... ($i/30)"
-    sleep 1
-done
-
-if [ -z "$VPN_IP" ]; then
-    log_msg "Failed to determine VPN server IP - giving up"
-    exit 0
-fi
-
-# Log current state for debugging
-TUN_STATE=$(@iproute2@/bin/ip -br addr show dev tun0 2>/dev/null || echo "tun0: NOT_FOUND")
-CURRENT_VPN_ROUTE=$(@iproute2@/bin/ip route show "$VPN_IP" 2>/dev/null || echo "no route")
-NM_STATE=$(@networkmanager@/bin/nmcli -t general status 2>/dev/null | head -1 || echo "unknown")
-log_msg "STATE: tun=[$TUN_STATE] vpn_route=[$CURRENT_VPN_ROUTE] nm=[$NM_STATE]"
-
 # Find interface with carrier that has a default route
+# We need the gateway first to use it as DNS server for resolving the VPN hostname
 if [ "$ACTION" = "down" ] || [ "$ACTION" = "connectivity-change" ] || [ -z "$IFACE" ]; then
     TARGET_DEV=""
     TARGET_GW=""
@@ -114,30 +92,55 @@ else
     done
 fi
 
-if [ -n "$TARGET_GW" ] && [ -n "$TARGET_DEV" ]; then
-    @iproute2@/bin/ip route del "$VPN_IP" 2>/dev/null || true
-    log_msg "Updating route to VPN server $VPN_IP via $TARGET_GW dev $TARGET_DEV"
-    @iproute2@/bin/ip route add "$VPN_IP" via "$TARGET_GW" dev "$TARGET_DEV" 2>/dev/null || true
-
-    sleep 1
-    if [ "$ENABLE_DTLS" = "true" ]; then
-        log_msg "Sending SIGTERM to openconnect (PID: $OPENCONNECT_PID) for full restart (DTLS mode)"
-        kill -TERM "$OPENCONNECT_PID"
-        for i in 1 2 3 4 5; do
-            sleep 1
-            if ! kill -0 "$OPENCONNECT_PID" 2>/dev/null; then
-                log_msg "openconnect exited after SIGTERM"
-                break
-            fi
-            if [ "$i" = "5" ]; then
-                log_msg "openconnect did not respond to SIGTERM, sending SIGKILL"
-                kill -9 "$OPENCONNECT_PID" 2>/dev/null || true
-            fi
-        done
-    else
-        log_msg "Sending SIGUSR2 to openconnect (PID: $OPENCONNECT_PID) to force reconnection"
-        kill -USR2 "$OPENCONNECT_PID"
-    fi
-else
+if [ -z "$TARGET_GW" ] || [ -z "$TARGET_DEV" ]; then
     log_msg "No suitable gateway/interface found"
+    exit 0
+fi
+
+# Resolve VPN server IP via DNS with retry
+# Use the gateway as DNS server to avoid unreachable VPN DNS servers in /etc/resolv.conf
+VPN_IP=""
+for i in $(@coreutils@/bin/seq 1 30); do
+    VPN_IP=$(@dnsutils@/bin/dig @"$TARGET_GW" +short +timeout=2 "$VPN_SERVER" 2>&1 | @gnugrep@/bin/grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -1)
+    if [ -n "$VPN_IP" ]; then
+        log_msg "Resolved VPN server $VPN_SERVER to $VPN_IP via $TARGET_GW after $i attempt(s)"
+        break
+    fi
+    log_msg "DNS resolution failed for $VPN_SERVER via $TARGET_GW, retrying... ($i/30)"
+    sleep 1
+done
+
+if [ -z "$VPN_IP" ]; then
+    log_msg "Failed to determine VPN server IP - giving up"
+    exit 0
+fi
+
+# Log current state for debugging
+TUN_STATE=$(@iproute2@/bin/ip -br addr show dev tun0 2>/dev/null || echo "tun0: NOT_FOUND")
+CURRENT_VPN_ROUTE=$(@iproute2@/bin/ip route show "$VPN_IP" 2>/dev/null || echo "no route")
+NM_STATE=$(@networkmanager@/bin/nmcli -t general status 2>/dev/null | head -1 || echo "unknown")
+log_msg "STATE: tun=[$TUN_STATE] vpn_route=[$CURRENT_VPN_ROUTE] nm=[$NM_STATE]"
+
+@iproute2@/bin/ip route del "$VPN_IP" 2>/dev/null || true
+log_msg "Updating route to VPN server $VPN_IP via $TARGET_GW dev $TARGET_DEV"
+@iproute2@/bin/ip route add "$VPN_IP" via "$TARGET_GW" dev "$TARGET_DEV" 2>/dev/null || true
+
+sleep 1
+if [ "$ENABLE_DTLS" = "true" ]; then
+    log_msg "Sending SIGTERM to openconnect (PID: $OPENCONNECT_PID) for full restart (DTLS mode)"
+    kill -TERM "$OPENCONNECT_PID"
+    for i in 1 2 3 4 5; do
+        sleep 1
+        if ! kill -0 "$OPENCONNECT_PID" 2>/dev/null; then
+            log_msg "openconnect exited after SIGTERM"
+            break
+        fi
+        if [ "$i" = "5" ]; then
+            log_msg "openconnect did not respond to SIGTERM, sending SIGKILL"
+            kill -9 "$OPENCONNECT_PID" 2>/dev/null || true
+        fi
+    done
+else
+    log_msg "Sending SIGUSR2 to openconnect (PID: $OPENCONNECT_PID) to force reconnection"
+    kill -USR2 "$OPENCONNECT_PID"
 fi
