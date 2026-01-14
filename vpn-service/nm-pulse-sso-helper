@@ -47,9 +47,13 @@ def get_env(name, default=''):
 
 
 def ip4_to_int(ip_str):
-    """Convert IPv4 address string to integer."""
+    """Convert IPv4 address string to integer.
+
+    Note: NetworkManager expects host byte order (little-endian) for IP addresses,
+    not network byte order, so we use '<I' instead of '!I'.
+    """
     try:
-        return struct.unpack('!I', socket.inet_aton(ip_str))[0]
+        return struct.unpack('<I', socket.inet_aton(ip_str))[0]
     except (socket.error, struct.error):
         return 0
 
@@ -90,6 +94,41 @@ def parse_dns_servers(dns_str):
             if ip_int:
                 servers.append(ip_int)
     return servers
+
+
+def get_local_gateway():
+    """
+    Get the default gateway from the active network interface (non-VPN).
+    Returns the gateway IP as an integer, or None if not found.
+    """
+    try:
+        # Get default route, excluding tun/tap devices
+        result = subprocess.run(
+            ['ip', 'route', 'show', 'default'],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+
+        for line in result.stdout.strip().split('\n'):
+            # Skip VPN interfaces
+            if 'tun' in line or 'tap' in line:
+                continue
+
+            # Parse: default via <gateway> dev <interface>
+            parts = line.split()
+            if len(parts) >= 3 and parts[0] == 'default' and parts[1] == 'via':
+                gateway = parts[2]
+                gateway_int = ip4_to_int(gateway)
+                if gateway_int:
+                    print(f"get_local_gateway: Found local gateway {gateway}", file=sys.stderr)
+                    return gateway_int
+
+        print("get_local_gateway: No non-VPN default route found", file=sys.stderr)
+        return None
+    except Exception as e:
+        print(f"get_local_gateway: Error finding gateway: {e}", file=sys.stderr)
+        return None
 
 
 def parse_routes():
@@ -151,7 +190,18 @@ def build_ip4_config():
     dns_str = get_env('INTERNAL_IP4_DNS')
     dns_servers = parse_dns_servers(dns_str)
     if dns_servers:
+        # Prepend local gateway as DNS to keep it first in resolv.conf
+        # This ensures local DNS responses are fast and VPN DNS is only used as fallback
+        local_gateway = get_local_gateway()
+        if local_gateway and local_gateway not in dns_servers:
+            print(f"build_ip4_config: Prepending local gateway DNS", file=sys.stderr)
+            dns_servers.insert(0, local_gateway)
+
         config['dns'] = dbus.Array([dbus.UInt32(s) for s in dns_servers], signature='u')
+        # DNS priority - higher value = lower priority in resolver order
+        # This ensures router DNS (priority 0) comes before VPN DNS (priority 100)
+        # Provides resilience: router answers public domains instantly, falls back to VPN for internal-only domains
+        config['dns-priority'] = dbus.Int32(100)
 
     # Domain
     domain = get_env('CISCO_DEF_DOMAIN')
@@ -346,8 +396,15 @@ def run_vpnc_script():
     if os.path.exists(VPNC_SCRIPT):
         print(f"Running vpnc-script: {VPNC_SCRIPT}", file=sys.stderr)
         try:
+            # Create a modified environment without DNS variables
+            # We handle DNS through NetworkManager D-Bus instead, which includes local gateway
+            env = os.environ.copy()
+            env.pop('INTERNAL_IP4_DNS', None)
+            env.pop('INTERNAL_IP6_DNS', None)
+            print(f"vpnc-script: DNS will be configured via NetworkManager, not vpnc-script", file=sys.stderr)
+
             # vpnc-script uses environment variables set by openconnect
-            result = subprocess.run([VPNC_SCRIPT], env=os.environ)
+            result = subprocess.run([VPNC_SCRIPT], env=env)
             print(f"vpnc-script exited with code: {result.returncode}", file=sys.stderr)
             return result.returncode == 0
         except Exception as e:

@@ -12,6 +12,7 @@
   glib-networking,
   util-linux,
   systemd,
+  iproute2,
   cef-pulse-auth,
 }:
 
@@ -81,8 +82,9 @@ stdenv.mkDerivation rec {
       --set PYTHONPATH "${pythonEnvService}/${pythonEnvService.sitePackages}" \
       --add-flags "--helper-script $out/libexec/nm-pulse-sso-helper"
 
-    # Wrap the helper script
+    # Wrap the helper script (needs iproute2 for 'ip' command to detect local gateway)
     wrapProgram $out/libexec/nm-pulse-sso-helper \
+      --prefix PATH : ${lib.makeBinPath [ iproute2 ]} \
       --set PYTHONPATH "${pythonEnvService}/${pythonEnvService.sitePackages}" \
       --set VPNC_SCRIPT "${vpnc-scripts}/bin/vpnc-script"
 
