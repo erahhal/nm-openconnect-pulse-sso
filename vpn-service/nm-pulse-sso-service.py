@@ -41,6 +41,13 @@ NM_DBUS_PATH = '/org/freedesktop/NetworkManager/VPN/Plugin'
 # Config file written by NixOS
 CONFIG_PATH = Path('/etc/nm-pulse-sso/config')
 
+# NetworkManager connectivity states
+NM_CONNECTIVITY_UNKNOWN = 0
+NM_CONNECTIVITY_NONE = 1
+NM_CONNECTIVITY_PORTAL = 2
+NM_CONNECTIVITY_LIMITED = 3
+NM_CONNECTIVITY_FULL = 4
+
 
 def is_dtls_enabled() -> bool:
     """
@@ -179,6 +186,13 @@ class PulseSSOPlugin(dbus.service.Object):
         # This handles cases where plasma-nm or other agents don't support our VPN type
         self._secrets_timeout_id: Optional[int] = None
         self._secrets_timeout_ms: int = 5000  # 5 seconds to wait for secrets agent
+
+        # Captive portal / connectivity monitoring
+        self._connectivity_state: int = NM_CONNECTIVITY_UNKNOWN
+        self._waiting_for_connectivity: bool = False
+        self._connectivity_timeout_id: Optional[int] = None
+        self._connectivity_timeout_ms: int = 300000  # 5 minutes max wait for captive portal
+        self._nm_connectivity_signal_match = None
 
     def _do_connect(self, connection: dict):
         """
@@ -523,6 +537,144 @@ class PulseSSOPlugin(dbus.service.Object):
 
         return False
 
+    def _subscribe_connectivity_signal(self):
+        """
+        Subscribe to NetworkManager's PropertiesChanged signal to monitor connectivity.
+
+        This enables detection of captive portal clearance without polling.
+        """
+        try:
+            bus = dbus.SystemBus()
+            nm_proxy = bus.get_object(
+                'org.freedesktop.NetworkManager',
+                '/org/freedesktop/NetworkManager'
+            )
+
+            # Subscribe to PropertiesChanged on the Properties interface
+            self._nm_connectivity_signal_match = bus.add_signal_receiver(
+                handler_function=self._on_nm_properties_changed,
+                signal_name='PropertiesChanged',
+                dbus_interface='org.freedesktop.DBus.Properties',
+                bus_name='org.freedesktop.NetworkManager',
+                path='/org/freedesktop/NetworkManager'
+            )
+
+            # Get initial connectivity state
+            props_iface = dbus.Interface(nm_proxy, 'org.freedesktop.DBus.Properties')
+            self._connectivity_state = int(props_iface.Get(
+                'org.freedesktop.NetworkManager',
+                'Connectivity'
+            ))
+            logger.info('Subscribed to NM connectivity signals, current state: %d',
+                       self._connectivity_state)
+        except Exception as e:
+            logger.warning('Failed to subscribe to NM connectivity signal: %s', e)
+
+    def _on_nm_properties_changed(self, interface_name: str, changed_properties: dict,
+                                  invalidated_properties: list):
+        """
+        Handle NetworkManager PropertiesChanged signal.
+
+        Monitors Connectivity property to detect captive portal clearance.
+        """
+        if interface_name != 'org.freedesktop.NetworkManager':
+            return
+
+        connectivity = changed_properties.get('Connectivity')
+        if connectivity is None:
+            return
+
+        old_state = self._connectivity_state
+        self._connectivity_state = int(connectivity)
+
+        logger.info('NM connectivity changed: %d -> %d', old_state, self._connectivity_state)
+
+        # Check if we were waiting for connectivity and it's now FULL
+        if self._waiting_for_connectivity and self._connectivity_state == NM_CONNECTIVITY_FULL:
+            logger.info('Connectivity restored to FULL, proceeding with auth')
+            self._waiting_for_connectivity = False
+            self._cancel_connectivity_timeout()
+            # Now actually launch the auth dialog
+            self._schedule_direct_auth(0)
+
+    def _wait_for_connectivity(self):
+        """
+        Start waiting for connectivity to become FULL (captive portal cleared).
+
+        Sets up a timeout to avoid waiting indefinitely if user never clears
+        the captive portal.
+        """
+        if self._waiting_for_connectivity:
+            logger.debug('Already waiting for connectivity')
+            return
+
+        self._waiting_for_connectivity = True
+
+        # Schedule timeout
+        self._cancel_connectivity_timeout()
+        self._connectivity_timeout_id = GLib.timeout_add(
+            self._connectivity_timeout_ms,
+            self._on_connectivity_timeout
+        )
+
+        logger.info('Waiting up to %d seconds for connectivity to become FULL',
+                   self._connectivity_timeout_ms // 1000)
+
+    def _on_connectivity_timeout(self) -> bool:
+        """
+        Called when connectivity wait times out.
+
+        User may have given up on captive portal - emit failure and clean up.
+        Returns False to prevent GLib timeout from repeating.
+        """
+        self._connectivity_timeout_id = None
+        self._waiting_for_connectivity = False
+
+        logger.error('Timed out waiting for connectivity (still %d)',
+                    self._connectivity_state)
+
+        # Check one more time in case connectivity changed just now
+        self._refresh_connectivity_state()
+
+        if self._connectivity_state == NM_CONNECTIVITY_FULL:
+            logger.info('Connectivity became FULL just before timeout, proceeding')
+            self._schedule_direct_auth(0)
+            return False
+
+        # Give up - user never cleared captive portal
+        self._reconnection_pending = False
+        self.StateChanged(ServiceState.Stopped)
+        self.Failure('VPN reconnection aborted - captive portal not cleared within timeout')
+
+        return False
+
+    def _cancel_connectivity_timeout(self):
+        """Cancel any pending connectivity timeout."""
+        if self._connectivity_timeout_id is not None:
+            GLib.source_remove(self._connectivity_timeout_id)
+            self._connectivity_timeout_id = None
+
+    def _refresh_connectivity_state(self):
+        """
+        Synchronously refresh connectivity state from NetworkManager.
+
+        Used when we need an immediate check rather than waiting for signals.
+        """
+        try:
+            bus = dbus.SystemBus()
+            nm_proxy = bus.get_object(
+                'org.freedesktop.NetworkManager',
+                '/org/freedesktop/NetworkManager'
+            )
+            props_iface = dbus.Interface(nm_proxy, 'org.freedesktop.DBus.Properties')
+            self._connectivity_state = int(props_iface.Get(
+                'org.freedesktop.NetworkManager',
+                'Connectivity'
+            ))
+            logger.debug('Refreshed connectivity state: %d', self._connectivity_state)
+        except Exception as e:
+            logger.warning('Failed to refresh connectivity state: %s', e)
+
     def _ensure_direct_auth(self, reason: str, delay_ms: int = 0):
         """
         Ensure the direct auth flow is scheduled (used when NM hands us a stale cookie).
@@ -548,6 +700,13 @@ class PulseSSOPlugin(dbus.service.Object):
         """
         # GLib invoked this callback; clear the stored source ID
         self._direct_auth_timeout_id = None
+
+        # Check if we're behind a captive portal - wait for it to clear first
+        if self._connectivity_state != NM_CONNECTIVITY_FULL:
+            logger.info('Connectivity not FULL (%d), waiting for captive portal clearance',
+                       self._connectivity_state)
+            self._wait_for_connectivity()
+            return False  # Don't proceed yet - will retry when connectivity is FULL
 
         if not self._reconnection_pending:
             logger.debug('Reconnection no longer pending, skipping direct auth')
@@ -843,6 +1002,8 @@ class PulseSSOPlugin(dbus.service.Object):
         self.pending_connection = None
         self._cancel_direct_auth_timer()
         self._cancel_secrets_timeout()
+        self._waiting_for_connectivity = False
+        self._cancel_connectivity_timeout()
 
         if self.proc is not None:
             logger.info('Terminating openconnect process %d', self.proc.pid)
@@ -1071,6 +1232,9 @@ def run(args: Namespace):
         bus_name=bus_name,
         helper_script=args.helper_script,
     )
+
+    # Subscribe to NM connectivity signals for captive portal detection
+    plugin._subscribe_connectivity_signal()
 
     # Handle termination signals
     def handle_signal(signum, frame):
