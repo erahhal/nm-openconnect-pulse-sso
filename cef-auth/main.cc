@@ -267,6 +267,9 @@ public:
             // Disable software compositing fallback
             command_line->AppendSwitch("disable-software-rasterizer");
 
+            // Set unique app-id for window managers (Wayland app_id / X11 WM_CLASS)
+            command_line->AppendSwitchWithValue("class", "pulse-vpn-auth");
+
             // Load extension if specified
             if (!g_extension_path.empty()) {
                 command_line->AppendSwitchWithValue("load-extension", g_extension_path);
