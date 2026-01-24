@@ -199,6 +199,7 @@ in
     systemd.services.vpn-reconnect = lib.mkIf cfg.enableRecovery {
       description = "Reconnect VPN after system resume";
       wantedBy = [ "post-resume.target" ];
+      wants = [ "network-online.target" ];
       after = [ "post-resume.target" "network-online.target" ];
 
       serviceConfig = {
