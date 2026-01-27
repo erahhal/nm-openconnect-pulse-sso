@@ -203,17 +203,38 @@ def build_ip4_config():
         # Provides resilience: router answers public domains instantly, falls back to VPN for internal-only domains
         config['dns-priority'] = dbus.Int32(100)
 
-    # Domain
-    domain = get_env('CISCO_DEF_DOMAIN')
-    if domain:
-        config['domain'] = domain
-
     # DNS search domains
+    # Collect domains from both CISCO_DEF_DOMAIN and CISCO_SPLIT_DNS
+    # Some VPN servers put all domains in DEF_DOMAIN as space-separated string
+    all_domains = []
+
+    # Parse CISCO_DEF_DOMAIN - may contain multiple space-separated domains
+    def_domain = get_env('CISCO_DEF_DOMAIN')
+    print(f"build_ip4_config: CISCO_DEF_DOMAIN raw value: {repr(def_domain)}", file=sys.stderr)
+    if def_domain:
+        # Split by whitespace to handle space-separated domains
+        def_domains = [d.strip() for d in def_domain.split() if d.strip()]
+        all_domains.extend(def_domains)
+
+    # Parse CISCO_SPLIT_DNS - may be comma or space separated
     split_dns = get_env('CISCO_SPLIT_DNS')
+    print(f"build_ip4_config: CISCO_SPLIT_DNS raw value: {repr(split_dns)}", file=sys.stderr)
     if split_dns:
-        domains = [d.strip() for d in split_dns.split(',') if d.strip()]
-        if domains:
-            config['domains'] = dbus.Array(domains, signature='s')
+        if ',' in split_dns:
+            split_domains = [d.strip() for d in split_dns.split(',') if d.strip()]
+        else:
+            split_domains = [d.strip() for d in split_dns.split() if d.strip()]
+        # Add any domains not already in the list
+        for d in split_domains:
+            if d not in all_domains:
+                all_domains.append(d)
+
+    print(f"build_ip4_config: Final domains list: {all_domains}", file=sys.stderr)
+
+    # Set the primary domain (first one) and all domains as search list
+    if all_domains:
+        config['domain'] = all_domains[0]
+        config['domains'] = dbus.Array(all_domains, signature='s')
 
     # Routes
     routes = parse_routes()
