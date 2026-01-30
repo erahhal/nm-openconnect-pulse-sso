@@ -41,7 +41,7 @@ let
   # VPN reconnect script (for post-resume.target)
   vpn-reconnect-script = pkgs.runCommand "vpn-reconnect" { } ''
     install -Dm755 ${pkgs.replaceVars ./scripts/vpn-reconnect.sh {
-      inherit (pkgs) procps dnsutils gnugrep iproute2 gawk;
+      inherit (pkgs) coreutils dnsutils gnugrep networkmanager;
     }} $out
   '';
 
@@ -57,7 +57,7 @@ let
   # NetworkManager dispatcher script
   nm-dispatcher-script = pkgs.runCommand "nm-dispatcher" { } ''
     install -Dm755 ${pkgs.replaceVars ./scripts/nm-dispatcher.sh {
-      inherit (pkgs) procps coreutils dnsutils gnugrep iproute2 gawk networkmanager;
+      inherit (pkgs) coreutils dnsutils gnugrep gawk iproute2 networkmanager;
     }} $out
   '';
 
