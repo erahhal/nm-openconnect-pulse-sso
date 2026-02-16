@@ -1,0 +1,224 @@
+From 5d9ce1c2e35a0a2fe455bd7e947375d9ce2ef9bf Mon Sep 17 00:00:00 2001
+From: Matthew Wardrop <mpwardrop@gmail.com>
+Date: Fri, 13 Feb 2026 13:17:20 -0800
+Subject: [PATCH] Add support for TCP keepalive.
+
+Signed-off-by: Matthew Wardrop <mpwardrop@gmail.com>
+---
+ gnutls.c               |  3 +++
+ libopenconnect.map.in  |  5 +++++
+ library.c              |  7 +++++++
+ main.c                 |  7 +++++++
+ openconnect-internal.h |  3 +++
+ openconnect.h          |  1 +
+ openssl.c              |  4 ++++
+ ssl.c                  | 45 ++++++++++++++++++++++++++++++++++++++++++
+ 8 files changed, 75 insertions(+)
+
+diff --git a/gnutls.c b/gnutls.c
+index 394a3332..3472d57c 100644
+--- a/gnutls.c
++++ b/gnutls.c
+@@ -2482,6 +2482,9 @@ int openconnect_open_https(struct openconnect_info *vpninfo)
+ 	if (err)
+ 		return err;
+
++	/* Ensure that this channel remains open even when most traffic passes through UDP */
++	set_tcp_keepalive(vpninfo, ssl_sock);
++
+ 	vpninfo->ssl_fd = ssl_sock;
+
+ 	vpninfo->ssl_read = openconnect_gnutls_read;
+diff --git a/libopenconnect.map.in b/libopenconnect.map.in
+index f036c071..9e026ebc 100644
+--- a/libopenconnect.map.in
++++ b/libopenconnect.map.in
+@@ -132,6 +132,11 @@ OPENCONNECT_5_9 {
+ 	openconnect_set_sni;
+ } OPENCONNECT_5_8;
+
++OPENCONNECT_9_12 {
++ global:
++	openconnect_set_tcp_keepalive;
++} OPENCONNECT_5_9;
++
+ OPENCONNECT_PRIVATE {
+  global: @SYMVER_TIME@ @SYMVER_GETLINE@ @SYMVER_JAVA@ @SYMVER_ASPRINTF@ @SYMVER_VASPRINTF@ @SYMVER_WIN32_STRERROR@ @SYMVER_WIN32_SETENV@
+ 	openconnect_get_tls_library_version;
+diff --git a/library.c b/library.c
+index b5e74e9b..34d9a9d8 100644
+--- a/library.c
++++ b/library.c
+@@ -1127,6 +1127,13 @@ void openconnect_set_trojan_interval(struct openconnect_info *vpninfo, int secon
+ 	vpninfo->trojan_interval = seconds;
+ }
+
++void openconnect_set_tcp_keepalive(struct openconnect_info *vpninfo, int seconds)
++{
++	vpninfo->tcp_keepalive_enabled = 1;
++	if (seconds >= 0)
++		vpninfo->tcp_keepalive_idle = seconds;
++}
++
+ int openconnect_get_idle_timeout(struct openconnect_info *vpninfo)
+ {
+ 	return vpninfo->idle_timeout;
+diff --git a/main.c b/main.c
+index 6c21796b..55241dbb 100644
+--- a/main.c
++++ b/main.c
+@@ -184,6 +184,7 @@ enum {
+ 	OPT_FORCE_TROJAN,
+ 	OPT_GNUTLS_DEBUG,
+ 	OPT_JUNIPER,
++	OPT_KEEPALIVE,
+ 	OPT_KEY_PASSWORD_FROM_FSID,
+ 	OPT_LIBPROXY,
+ 	OPT_NO_CERT_CHECK,
+@@ -301,6 +302,7 @@ static const struct option long_options[] = {
+ 	OPTION("no-cert-check", 0, OPT_NO_CERT_CHECK),
+ 	OPTION("force-dpd", 1, OPT_FORCE_DPD),
+ 	OPTION("force-trojan", 1, OPT_FORCE_TROJAN),
++	OPTION("keepalive", 2, OPT_KEEPALIVE),
+ 	OPTION("non-inter", 0, OPT_NON_INTER),
+ 	OPTION("dtls-local-port", 1, OPT_DTLS_LOCAL_PORT),
+ 	OPTION("token-mode", 1, OPT_TOKEN_MODE),
+@@ -1109,6 +1111,7 @@ static void usage(void)
+ 	printf("      --no-dtls                   %s\n", _("Disable DTLS and ESP"));
+ 	printf("      --dtls-ciphers=LIST         %s\n", _("OpenSSL ciphers to support for DTLS"));
+ 	printf("  -Q, --queue-len=LEN             %s\n", _("Set packet queue limit to LEN pkts"));
++	printf("      --keepalive{=INTERVAL}      %s\n", _("Enable keepalive on the TCP channel (with an optinal interval in seconds)"));
+
+ 	printf("\n%s:\n", _("Local system information"));
+ 	printf("      --useragent=STRING          %s\n", _("HTTP header User-Agent: field"));
+@@ -1588,6 +1591,7 @@ static int autocomplete(int argc, char **argv)
+ 			case OPT_VERSION: /* --version-string */
+ 			case OPT_FORCE_DPD: /* --force-dpd */
+ 			case OPT_FORCE_TROJAN: /* --force-trojan */
++			case OPT_KEEPALIVE: /* --keepalive */
+ 			case OPT_DTLS_LOCAL_PORT: /* --dtls-local-port */
+ 			case 'F': /* --form-entry */
+ 			case OPT_GNUTLS_DEBUG: /* --gnutls-debug */
+@@ -2205,6 +2209,9 @@ int main(int argc, char *argv[])
+ 			assert_nonnull_config_arg("force-trojan", config_arg);
+ 			openconnect_set_trojan_interval(vpninfo, atoi(config_arg));
+ 			break;
++		case OPT_KEEPALIVE:
++			openconnect_set_tcp_keepalive(vpninfo, config_arg ? atoi(config_arg) : 0);
++			break;
+ 		case OPT_DTLS_LOCAL_PORT:
+ 			assert_nonnull_config_arg("dtls-local-port", config_arg);
+ 			vpninfo->dtls_local_port = atoi(config_arg);
+diff --git a/openconnect-internal.h b/openconnect-internal.h
+index abf45bbd..4f64d003 100644
+--- a/openconnect-internal.h
++++ b/openconnect-internal.h
+@@ -528,6 +528,8 @@ struct openconnect_info {
+ 	time_t last_trojan;
+ 	int no_http_keepalive;
+ 	int dump_http_traffic;
++	int tcp_keepalive_enabled;
++	int tcp_keepalive_idle;
+
+ 	int token_mode;
+ 	int token_bypassed;
+@@ -1410,6 +1412,7 @@ int lzs_compress(unsigned char *dst, int dstlen, const unsigned char *src, int s
+ /* ssl.c */
+ unsigned string_is_hostname(const char *str);
+ int connect_https_socket(struct openconnect_info *vpninfo);
++int set_tcp_keepalive(struct openconnect_info *vpninfo, int ssl_sock);
+ int __attribute__ ((format(printf, 4, 5)))
+     request_passphrase(struct openconnect_info *vpninfo, const char *label,
+ 		       char **response, const char *fmt, ...);
+diff --git a/openconnect.h b/openconnect.h
+index 136f181a..52fd8483 100644
+--- a/openconnect.h
++++ b/openconnect.h
+@@ -653,6 +653,7 @@ const char *openconnect_get_ifname(struct openconnect_info *);
+ void openconnect_set_reqmtu(struct openconnect_info *, int reqmtu);
+ void openconnect_set_dpd(struct openconnect_info *, int min_seconds);
+ void openconnect_set_trojan_interval(struct openconnect_info *, int seconds);
++void openconnect_set_tcp_keepalive(struct openconnect_info *, int seconds);
+ int openconnect_get_idle_timeout(struct openconnect_info *);
+ time_t openconnect_get_auth_expiration(struct openconnect_info *);
+
+diff --git a/openssl.c b/openssl.c
+index 761cb034..088a1348 100644
+--- a/openssl.c
++++ b/openssl.c
+@@ -2059,6 +2059,9 @@ int openconnect_open_https(struct openconnect_info *vpninfo)
+ 		closesocket(ssl_sock);
+ 		return -ENOMEM;
+ 	}
++
++	/* Ensure that this channel remains open even when most traffic passes through UDP */
++	set_tcp_keepalive(vpninfo, ssl_sock);
+
+ 	vpninfo->ssl_fd = ssl_sock;
+ 	vpninfo->https_ssl = https_ssl;
+@@ -2068,6 +2071,7 @@ int openconnect_open_https(struct openconnect_info *vpninfo)
+ 	vpninfo->ssl_gets = openconnect_openssl_gets;
+
+
++
+ 	vpn_progress(vpninfo, PRG_INFO, _("Connected to HTTPS on %s with ciphersuite %s\n"),
+ 		     vpninfo->hostname, vpninfo->cstp_cipher);
+
+diff --git a/ssl.c b/ssl.c
+index b64c8979..46732262 100644
+--- a/ssl.c
++++ b/ssl.c
+@@ -261,6 +261,51 @@ static int set_tcp_nodelay(struct openconnect_info *vpninfo, int ssl_sock)
+ 	return 0;
+ }
+
++int set_tcp_keepalive(struct openconnect_info *vpninfo, int ssl_sock)
++{
++	int keepalive = vpninfo->tcp_keepalive_enabled;
++	if (!keepalive) {
++		return 0;
++	}
++
++	int keepidle = vpninfo->tcp_keepalive_idle;
++
++	/* Enable TCP keepalive */
++	if (setsockopt(ssl_sock, SOL_SOCKET, SO_KEEPALIVE, (void *)&keepalive, sizeof(keepalive)) < 0) {
++		vpn_perror(vpninfo,
++			   _("Failed setsockopt(SO_KEEPALIVE) on TLS socket:"));
++#ifdef _WIN32
++		return WSAGetLastError();
++#else
++		return -errno;
++#endif
++	}
++
++#ifdef TCP_KEEPIDLE
++	/* Linux, FreeBSD */
++	if (keepidle >= 0 && setsockopt(ssl_sock, IPPROTO_TCP, TCP_KEEPIDLE, (void *)&keepidle, sizeof(keepidle)) < 0) {
++		vpn_perror(vpninfo,
++			_("Failed setsockopt(TCP_KEEPIDLE) on TLS socket:"));
++	}
++#elif defined(TCP_KEEPALIVE)
++	/* macOS */
++	if (keepidle >= 0 && setsockopt(ssl_sock, IPPROTO_TCP, TCP_KEEPALIVE, (void *)&keepidle, sizeof(keepidle)) < 0) {
++		vpn_perror(vpninfo,
++			_("Failed setsockopt(TCP_KEEPALIVE) on TLS socket:"));
++	}
++#endif
++
++	if (keepidle > 0) {
++		vpn_progress(vpninfo, PRG_DEBUG,
++			   _("TCP keepalive enabled: idle=%ds\n"), keepidle);
++	} else {
++		vpn_progress(vpninfo, PRG_DEBUG,
++			   _("TCP keepalive enabled with system defaults\n"));
++	}
++
++	return 0;
++}
++
+
+ int connect_https_socket(struct openconnect_info *vpninfo)
+ {
+--
+GitLab

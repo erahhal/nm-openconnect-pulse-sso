@@ -63,6 +63,31 @@ def is_dtls_enabled() -> bool:
     return False
 
 
+def get_tcp_keepalive_config() -> tuple:
+    """
+    Read TCP keepalive settings from the NixOS config file.
+
+    Returns (enabled: bool, interval: int or None).
+    """
+    enabled = False
+    interval = None
+    try:
+        if CONFIG_PATH.exists():
+            content = CONFIG_PATH.read_text()
+            for line in content.splitlines():
+                line = line.strip()
+                if line.startswith('ENABLE_TCP_KEEPALIVE='):
+                    value = line.split('=', 1)[1].strip().lower()
+                    enabled = value == 'true'
+                elif line.startswith('TCP_KEEPALIVE_INTERVAL='):
+                    val = line.split('=', 1)[1].strip()
+                    if val:
+                        interval = int(val)
+    except Exception as e:
+        logger.warning('Failed to read TCP keepalive config: %s', e)
+    return enabled, interval
+
+
 # Setup logging
 logging.basicConfig(
     level=logging.INFO,
@@ -267,6 +292,16 @@ class PulseSSOPlugin(dbus.service.Object):
         # Only add --no-dtls if DTLS is disabled
         if not dtls_enabled:
             cmd.append('--no-dtls')
+
+        # TCP keepalive handling
+        keepalive_enabled, keepalive_interval = get_tcp_keepalive_config()
+        if keepalive_enabled:
+            if keepalive_interval is not None:
+                cmd.append(f'--keepalive={keepalive_interval}')
+            else:
+                cmd.append('--keepalive')
+            logger.info('TCP keepalive: enabled (interval=%s)',
+                        keepalive_interval if keepalive_interval else 'system default')
 
         cmd.extend([
             '-C', self.cookie,
