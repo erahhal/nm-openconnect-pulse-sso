@@ -141,7 +141,7 @@ in
 
     tcpKeepaliveInterval = lib.mkOption {
       type = lib.types.nullOr lib.types.ints.positive;
-      default = 10;
+      default = 120;
       description = ''
         TCP keepalive idle interval in seconds. Only used when
         enableTcpKeepalive is true. When null, uses system defaults.
