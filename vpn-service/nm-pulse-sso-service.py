@@ -206,6 +206,16 @@ class PulseSSOPlugin(dbus.service.Object):
         # Track any pending direct-auth timer (GLib source ID) to prevent duplicates
         self._direct_auth_timeout_id: Optional[int] = None
 
+        # Track the running auth-dialog subprocess for cancellation
+        self._auth_dialog_proc: Optional[Popen] = None
+        self._auth_dialog_child_watch_id: Optional[int] = None
+        self._auth_dialog_timeout_id: Optional[int] = None
+
+        # State for async auth-dialog launch fallback chain
+        self._auth_launch_commands: list = []
+        self._auth_launch_index: int = 0
+        self._auth_input_data: bytes = b""
+
         # Track secrets request timeout - if NM's agent doesn't respond, fall back to direct auth
         # This handles cases where plasma-nm or other agents don't support our VPN type
         self._secrets_timeout_id: Optional[int] = None
@@ -530,6 +540,26 @@ class PulseSSOPlugin(dbus.service.Object):
             GLib.source_remove(self._direct_auth_timeout_id)
             self._direct_auth_timeout_id = None
 
+    def _kill_auth_dialog(self):
+        """Kill any running auth-dialog subprocess and clean up.
+
+        Since auth-dialog is launched via systemd-run --pipe --wait, killing the
+        systemd-run process causes systemd to stop the transient unit and its
+        cgroup, which terminates the auth-dialog and CEF browser.
+        """
+        proc = self._auth_dialog_proc
+        if proc is not None:
+            logger.info("Killing auth-dialog subprocess PID %d", proc.pid)
+            try:
+                proc.kill()
+            except OSError:
+                pass  # Process may have already exited
+            self._auth_dialog_proc = None
+
+        if self._auth_dialog_timeout_id is not None:
+            GLib.source_remove(self._auth_dialog_timeout_id)
+            self._auth_dialog_timeout_id = None
+
     def _schedule_secrets_timeout(self):
         """
         Schedule a fallback to direct auth if no secrets arrive.
@@ -620,7 +650,10 @@ class PulseSSOPlugin(dbus.service.Object):
 
         After suspend/resume, nm-applet's secret agent often doesn't respond.
         This method bypasses NM entirely by running the auth-dialog directly
-        in the user's graphical session using runuser.
+        in the user's graphical session using systemd-run.
+
+        Non-blocking: starts the subprocess and returns immediately.
+        _on_auth_dialog_exit() handles the result when the process exits.
 
         Returns False to prevent GLib timeout from repeating.
         """
@@ -787,7 +820,8 @@ class PulseSSOPlugin(dbus.service.Object):
             if xauthority:
                 env_args.append(f"--setenv=XAUTHORITY={xauthority}")
 
-            launch_commands = [
+            # Store launch commands for the async fallback chain
+            self._auth_launch_commands = [
                 # Primary path: use user manager via machine bridge.
                 [
                     "systemd-run",
@@ -824,91 +858,193 @@ class PulseSSOPlugin(dbus.service.Object):
                     auth_dialog,
                 ],
             ]
+            self._auth_launch_index = 0
 
             # Auth-dialog protocol: send gateway via stdin
-            input_data = f"DATA_KEY=gateway\nDATA_VAL={self.gateway}\nDONE\n"
+            self._auth_input_data = f"DATA_KEY=gateway\nDATA_VAL={self.gateway}\nDONE\n".encode()
 
-            stdout = b""
-            stderr = b""
-            returncode = 1
-            for i, launch_cmd in enumerate(launch_commands, start=1):
-                logger.debug(
-                    "Auth-dialog launch attempt %d/%d: %s",
-                    i,
-                    len(launch_commands),
-                    " ".join(launch_cmd[:4]),
-                )
-                proc = subprocess.Popen(
-                    launch_cmd,
-                    stdin=subprocess.PIPE,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                )
-                stdout, stderr = proc.communicate(
-                    input=input_data.encode(), timeout=300
-                )
-                returncode = proc.returncode
-                if returncode == 0:
-                    break
+            # Start the first launch attempt (non-blocking)
+            self._try_next_auth_launch()
 
-            if returncode != 0:
-                logger.error(
-                    "Auth-dialog failed after %d launch strategies (exit %d): %s",
-                    len(launch_commands),
-                    returncode,
-                    stderr.decode(),
-                )
-                self._schedule_direct_auth(self._reconnection_retry_interval)
-                return False
-
-            # Parse cookie from stdout (protocol: key\nvalue\nkey\nvalue...)
-            lines = stdout.decode().strip().split("\n")
-            cookie = None
-            gwcert = None
-            i = 0
-            while i < len(lines):
-                if lines[i] == "cookie" and i + 1 < len(lines):
-                    cookie = lines[i + 1]
-                    i += 2
-                elif lines[i] == "gwcert" and i + 1 < len(lines):
-                    gwcert = lines[i + 1]
-                    i += 2
-                else:
-                    i += 1
-
-            if not cookie:
-                logger.error("No cookie in auth-dialog output: %s", stdout.decode())
-                self._schedule_auth_retry("No cookie in auth-dialog output")
-                return False
-
-            # Success! Update credentials and start openconnect
-            logger.info("Got fresh cookie from auth-dialog, starting openconnect")
-            self.cookie = cookie
-            self.servercert = gwcert
-            self._last_failed_cookie = None
-
-            self.StateChanged(ServiceState.Starting)
-            try:
-                self._start_openconnect()
-                # Only clear reconnection state AFTER openconnect starts successfully
-                # This ensures retries work if _start_openconnect() fails
-                self._reconnection_pending = False
-                self._reconnection_retry_count = 0
-                self._auth_failure_count = 0
-                self._cancel_direct_auth_timer()
-            except Exception as e:
-                logger.exception("Failed to start openconnect after auth: %s", e)
-                self._schedule_auth_retry("Failed to start openconnect")
-                return False
-
-        except subprocess.TimeoutExpired:
-            logger.error("Auth-dialog timed out (user may have closed browser)")
-            self._schedule_auth_retry("Auth-dialog timed out")
         except Exception as e:
             logger.exception("Direct auth failed: %s", e)
             self._schedule_auth_retry(f"Direct auth failed: {e}")
 
         return False
+
+    def _try_next_auth_launch(self):
+        """Try the next auth-dialog launch strategy asynchronously."""
+        if not self._reconnection_pending:
+            logger.debug("Reconnection cancelled, aborting auth launch")
+            return
+
+        if self._auth_launch_index >= len(self._auth_launch_commands):
+            logger.error("Auth-dialog failed after all launch strategies")
+            self._schedule_auth_retry("All launch strategies failed")
+            return
+
+        launch_cmd = self._auth_launch_commands[self._auth_launch_index]
+        logger.debug(
+            "Auth-dialog launch attempt %d/%d: %s",
+            self._auth_launch_index + 1,
+            len(self._auth_launch_commands),
+            " ".join(launch_cmd[:4]),
+        )
+
+        try:
+            proc = subprocess.Popen(
+                launch_cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+
+            # Write input data and close stdin immediately.
+            # Non-blocking for small data (< PIPE_BUF = 4096 bytes on Linux).
+            proc.stdin.write(self._auth_input_data)
+            proc.stdin.close()
+
+            # Store the proc so Disconnect() can kill it
+            self._auth_dialog_proc = proc
+
+            # Monitor the process asynchronously via GLib
+            self._auth_dialog_child_watch_id = GLib.child_watch_add(
+                proc.pid, self._on_auth_dialog_exit
+            )
+
+            # Set a timeout for the auth-dialog (300 seconds)
+            self._auth_dialog_timeout_id = GLib.timeout_add(
+                300_000, self._on_auth_dialog_timeout
+            )
+
+        except Exception as e:
+            logger.error(
+                "Failed to launch auth-dialog (attempt %d): %s",
+                self._auth_launch_index + 1,
+                e,
+            )
+            self._auth_launch_index += 1
+            # Try next strategy via idle callback to avoid deep recursion
+            GLib.idle_add(self._try_next_auth_launch)
+
+    def _on_auth_dialog_timeout(self) -> bool:
+        """Called when auth-dialog has been running too long. Kill it."""
+        self._auth_dialog_timeout_id = None
+        logger.error("Auth-dialog timed out (300s)")
+        self._kill_auth_dialog()
+        return False
+
+    def _on_auth_dialog_exit(self, pid: int, status: int):
+        """
+        Called by GLib when auth-dialog subprocess exits.
+
+        Reads output from the process pipes, parses the cookie,
+        and either starts openconnect or schedules a retry.
+        """
+        # Cancel the timeout
+        if self._auth_dialog_timeout_id is not None:
+            GLib.source_remove(self._auth_dialog_timeout_id)
+            self._auth_dialog_timeout_id = None
+
+        self._auth_dialog_child_watch_id = None
+        proc = self._auth_dialog_proc
+        self._auth_dialog_proc = None
+
+        if proc is None or proc.pid != pid:
+            logger.debug("Ignoring exit for unknown auth-dialog PID %d", pid)
+            return
+
+        # Check if disconnect was requested while we were waiting
+        if not self._reconnection_pending:
+            logger.info(
+                "Reconnection no longer pending after auth-dialog exit, not retrying"
+            )
+            # Clean up pipes
+            try:
+                proc.stdout.close()
+                proc.stderr.close()
+            except Exception:
+                pass
+            return
+
+        # Get exit code
+        if os.WIFEXITED(status):
+            exit_code = os.WEXITSTATUS(status)
+        elif os.WIFSIGNALED(status):
+            exit_code = -os.WTERMSIG(status)
+        else:
+            exit_code = status
+
+        # Read stdout/stderr now that process has exited.
+        # Safe because the process is dead and data is in kernel pipe buffers.
+        try:
+            stdout = proc.stdout.read()
+            stderr = proc.stderr.read()
+            proc.stdout.close()
+            proc.stderr.close()
+        except Exception as e:
+            logger.error("Failed to read auth-dialog output: %s", e)
+            self._schedule_auth_retry("Failed to read auth-dialog output")
+            return
+
+        if exit_code != 0:
+            logger.error(
+                "Auth-dialog (attempt %d) failed (exit %d): %s",
+                self._auth_launch_index + 1,
+                exit_code,
+                stderr.decode(errors="replace"),
+            )
+            # Try next launch strategy
+            self._auth_launch_index += 1
+            if self._auth_launch_index < len(self._auth_launch_commands):
+                self._try_next_auth_launch()
+            else:
+                self._schedule_auth_retry("All launch strategies failed")
+            return
+
+        # Parse cookie from stdout (protocol: key\nvalue\nkey\nvalue...)
+        lines = stdout.decode().strip().split("\n")
+        cookie = None
+        gwcert = None
+        i = 0
+        while i < len(lines):
+            if lines[i] == "cookie" and i + 1 < len(lines):
+                cookie = lines[i + 1]
+                i += 2
+            elif lines[i] == "gwcert" and i + 1 < len(lines):
+                gwcert = lines[i + 1]
+                i += 2
+            else:
+                i += 1
+
+        if not cookie:
+            logger.error("No cookie in auth-dialog output: %s", stdout.decode())
+            self._schedule_auth_retry("No cookie in auth-dialog output")
+            return
+
+        # Check disconnect again (could have been requested during output parsing)
+        if not self._reconnection_pending:
+            logger.info("Disconnect requested, discarding auth result")
+            return
+
+        # Success! Update credentials and start openconnect
+        logger.info("Got fresh cookie from auth-dialog, starting openconnect")
+        self.cookie = cookie
+        self.servercert = gwcert
+        self._last_failed_cookie = None
+
+        self.StateChanged(ServiceState.Starting)
+        try:
+            self._start_openconnect()
+            # Only clear reconnection state AFTER openconnect starts successfully
+            # This ensures retries work if _start_openconnect() fails
+            self._reconnection_pending = False
+            self._reconnection_retry_count = 0
+            self._auth_failure_count = 0
+            self._cancel_direct_auth_timer()
+        except Exception as e:
+            logger.exception("Failed to start openconnect after auth: %s", e)
+            self._schedule_auth_retry("Failed to start openconnect")
 
     @method(
         dbus_interface=NM_DBUS_INTERFACE, in_signature="a{sa{sv}}", out_signature=""
@@ -1041,12 +1177,23 @@ class PulseSSOPlugin(dbus.service.Object):
         """
         logger.info("Disconnect called")
 
-        # If reconnection is in progress, don't quit - just mark disconnect requested
-        # The user may have clicked disconnect during re-auth, so we set the flag
-        # and let the reconnection logic handle it
+        # If reconnection is in progress, clean up but keep the service alive.
+        # NM's state machine may call Disconnect() in reaction to our
+        # StateChanged(Starting) during reconnection.  If we quit here, NM
+        # would have to D-Bus-activate a fresh service to reconnect, which
+        # can cause flapping or total loss of connectivity.  By staying
+        # alive we allow NM to call Connect() again on the same instance.
         if self._reconnection_pending:
-            logger.info("Disconnect called but reconnection pending, not quitting")
+            logger.info("Disconnect called during reconnection, cleaning up")
             self._disconnect_requested = True
+            self._reconnection_pending = False
+            self._reconnection_retry_count = 0
+
+            # Cancel any pending auth timer and kill running auth-dialog
+            self._cancel_direct_auth_timer()
+            self._cancel_secrets_timeout()
+            self._kill_auth_dialog()
+
             self.StateChanged(ServiceState.Stopped)
             return
 
