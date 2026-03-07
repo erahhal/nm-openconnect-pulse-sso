@@ -8,7 +8,60 @@ let
   cfg = config.services.nm-pulse-sso;
 
   # CEF-based authentication browser
-  pulse-browser-auth = pkgs.callPackage ./cef-auth/default.nix { };
+  pulse-browser-auth-base = pkgs.callPackage ./cef-auth/default.nix { };
+
+  # Extract extension IDs from packages that provide passthru.extensionId
+  extensionIds = lib.filter (id: id != null)
+    (map (ext: ext.extensionId or null) cfg.extensions);
+
+  # Script to pin extensions to the CEF toolbar before launch
+  pinExtensionsScript = pkgs.writeShellScript "pin-extensions" ''
+    PROFILE_DIR="$HOME/.cache/pulse-browser-auth/Default"
+    PREFS_FILE="$PROFILE_DIR/Preferences"
+    SECURE_PREFS="$PROFILE_DIR/Secure Preferences"
+    PINNED_IDS='${builtins.toJSON extensionIds}'
+
+    ${pkgs.coreutils}/bin/mkdir -p "$PROFILE_DIR"
+
+    if [ -f "$PREFS_FILE" ]; then
+      # Check if all desired extensions are already pinned (subset check).
+      # Extra user-pinned extensions are preserved.
+      MISSING=$(${pkgs.jq}/bin/jq --argjson desired "$PINNED_IDS" \
+        '[($desired[] | select(. as $d | (.extensions.pinned_extensions // []) | index($d) | not))]' \
+        "$PREFS_FILE" 2>/dev/null || echo "$PINNED_IDS")
+      if [ "$MISSING" != "[]" ]; then
+        # Merge desired into existing pinned list, preserving user-added extensions
+        MERGED=$(${pkgs.jq}/bin/jq --argjson desired "$PINNED_IDS" \
+          '((.extensions.pinned_extensions // []) + $desired) | unique' \
+          "$PREFS_FILE" 2>/dev/null || echo "$PINNED_IDS")
+        # Delete both Preferences and Secure Preferences together so Chrome recreates
+        # them consistently on startup. Modifying Preferences without updating Secure
+        # Preferences causes Chrome 142 (CEF_RUNTIME_STYLE_CHROME) to detect profile
+        # tampering and crash before showing the browser window.
+        ${pkgs.coreutils}/bin/rm -f "$PREFS_FILE"
+        ${pkgs.coreutils}/bin/rm -f "$SECURE_PREFS"
+        echo "{\"extensions\":{\"pinned_extensions\":$MERGED}}" | ${pkgs.jq}/bin/jq . > "$PREFS_FILE"
+      fi
+    fi
+    if [ ! -f "$PREFS_FILE" ]; then
+      # Create fresh Preferences with pinned extensions.
+      # Chrome will create a matching Secure Preferences on startup.
+      echo "{\"extensions\":{\"pinned_extensions\":$PINNED_IDS}}" | ${pkgs.jq}/bin/jq . > "$PREFS_FILE"
+    fi
+  '';
+
+  # Wrap browser to load extensions if configured
+  pulse-browser-auth = if cfg.extensions == [] then pulse-browser-auth-base
+    else pkgs.symlinkJoin {
+      name = "pulse-browser-auth-with-extensions";
+      paths = [ pulse-browser-auth-base ];
+      nativeBuildInputs = [ pkgs.makeWrapper ];
+      postBuild = ''
+        wrapProgram $out/bin/pulse-browser-auth \
+          --add-flags "--extension ${lib.concatStringsSep "," cfg.extensions}" \
+          ${lib.optionalString cfg.pinExtensions "--run ${pinExtensionsScript}"}
+      '';
+    };
 
   # Select implementation based on enableSelenium option
   nm-pulse-sso = if cfg.enableSelenium
@@ -145,6 +198,28 @@ in
       description = ''
         TCP keepalive idle interval in seconds. Only used when
         enableTcpKeepalive is true. When null, uses system defaults.
+      '';
+    };
+
+    extensions = lib.mkOption {
+      type = lib.types.listOf lib.types.package;
+      default = [];
+      description = ''
+        List of unpacked Chrome extension directories to load in the
+        CEF authentication browser. Each entry should be a derivation
+        whose output is an unpacked extension directory containing a
+        manifest.json. Derivations may include passthru.extensionId
+        for toolbar pinning support.
+      '';
+    };
+
+    pinExtensions = lib.mkOption {
+      type = lib.types.bool;
+      default = true;
+      description = ''
+        Pin loaded extensions to the CEF browser toolbar so they are
+        always visible. Requires extensions to have passthru.extensionId.
+        Only effective when extensions are configured.
       '';
     };
 

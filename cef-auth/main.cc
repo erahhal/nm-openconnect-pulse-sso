@@ -33,10 +33,19 @@ std::string g_windows_ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKi
 std::string g_linux_ua = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36";
 bool g_first_load_complete = false;
 bool g_ua_switched = false;
+bool g_startup_grace_period = true;
 
 // Forward declarations
 void ScheduleCookieCheck();
 void CheckAndCloseBrowser();
+
+// Task to end the startup grace period (allow new tabs after initial extension startup)
+class EndGracePeriodTask : public CefTask {
+public:
+    void Execute() override { g_startup_grace_period = false; }
+private:
+    IMPLEMENT_REFCOUNTING(EndGracePeriodTask);
+};
 
 // Resource request handler to modify User-Agent header per request
 class AuthResourceRequestHandler : public CefResourceRequestHandler {
@@ -100,6 +109,11 @@ public:
         CEF_REQUIRE_UI_THREAD();
         if (!g_browser) {
             g_browser = browser;
+            // End startup grace period after 5 seconds to allow user-initiated tabs
+            CefPostDelayedTask(TID_UI, new EndGracePeriodTask(), 5000);
+        } else if (g_startup_grace_period) {
+            // Close tabs opened by extensions during startup (e.g., 1Password welcome page)
+            browser->GetHost()->CloseBrowser(true);
         }
     }
 
@@ -123,8 +137,12 @@ public:
 
     void OnBeforeClose(CefRefPtr<CefBrowser> browser) override {
         CEF_REQUIRE_UI_THREAD();
-        g_browser = nullptr;
-        CefQuitMessageLoop();
+        // Only quit when the main browser (VPN auth tab) is closing,
+        // not when extension startup tabs are closed during grace period
+        if (g_browser && browser->GetIdentifier() == g_browser->GetIdentifier()) {
+            g_browser = nullptr;
+            CefQuitMessageLoop();
+        }
     }
 
     // CefLoadHandler - handle UA switching and cookie checking after page load
@@ -269,6 +287,9 @@ public:
 
             // Set unique app-id for window managers (Wayland app_id / X11 WM_CLASS)
             command_line->AppendSwitchWithValue("class", "pulse-vpn-auth");
+
+            // Suppress Chrome first-run behavior
+            command_line->AppendSwitch("no-first-run");
 
             // Load extension if specified
             if (!g_extension_path.empty()) {
