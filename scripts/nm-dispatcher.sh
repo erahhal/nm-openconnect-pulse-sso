@@ -3,7 +3,7 @@
 # NetworkManager Dispatcher Script (90-vpn-reconnect)
 #
 # Fixes VPN route and triggers reconnection when network interface changes.
-# Handles connectivity-change and down events for physical interfaces.
+# Handles connectivity-change, down, and up events for physical interfaces.
 
 # Log to both stdout and syslog for debugging
 log_msg() {
@@ -22,7 +22,7 @@ IFACE="$1"
 ACTION="$2"
 
 case "$ACTION" in
-    connectivity-change|down)
+    connectivity-change|down|up)
         ;;
     *)
         exit 0
