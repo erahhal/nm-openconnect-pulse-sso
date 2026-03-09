@@ -139,6 +139,18 @@ let
     }} $out
   '';
 
+  vpnc-post-connect-flush-dns = pkgs.runCommand "vpnc-post-connect-flush-dns" { } ''
+    install -Dm755 ${pkgs.replaceVars ./scripts/vpnc/post-connect-flush-dns.sh {
+      inherit (pkgs) systemd;
+    }} $out
+  '';
+
+  vpnc-reconnect-flush-dns = pkgs.runCommand "vpnc-reconnect-flush-dns" { } ''
+    install -Dm755 ${pkgs.replaceVars ./scripts/vpnc/reconnect-flush-dns.sh {
+      inherit (pkgs) systemd;
+    }} $out
+  '';
+
 in
 {
   options.services.nm-pulse-sso = {
@@ -348,6 +360,18 @@ in
     environment.etc."vpnc/reconnect.d/narrow-docker-route" = lib.mkIf cfg.enableRecovery {
       mode = "0755";
       source = vpnc-reconnect-narrow-docker;
+    };
+
+    # vpnc hook to flush DNS caches after VPN connection
+    environment.etc."vpnc/post-connect.d/flush-dns" = {
+      mode = "0755";
+      source = vpnc-post-connect-flush-dns;
+    };
+
+    # vpnc hook to flush DNS caches after VPN reconnection
+    environment.etc."vpnc/reconnect.d/flush-dns" = {
+      mode = "0755";
+      source = vpnc-reconnect-flush-dns;
     };
 
     # NetworkManager dispatcher to fix VPN route and trigger reconnection when interface changes
