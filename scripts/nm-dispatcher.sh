@@ -11,6 +11,10 @@ log_msg() {
     logger -t "90-vpn-reconnect" "$1"
 }
 
+# Prevent concurrent execution (rapid WiFi state changes spawn multiple instances)
+exec 9>/run/vpn-reconnect.lock
+flock -n 9 || { log_msg "Another instance already running, exiting"; exit 0; }
+
 # Read DTLS configuration
 ENABLE_DTLS="true"
 if [ -f /etc/nm-pulse-sso/config ]; then
@@ -124,6 +128,12 @@ log_msg "STATE: tun=[$TUN_STATE] vpn_route=[$CURRENT_VPN_ROUTE] nm=[$NM_STATE]"
 @iproute2@/bin/ip route del "$VPN_IP" 2>/dev/null || true
 log_msg "Updating route to VPN server $VPN_IP via $TARGET_GW dev $TARGET_DEV"
 @iproute2@/bin/ip route add "$VPN_IP" via "$TARGET_GW" dev "$TARGET_DEV" 2>/dev/null || true
+
+# Flush DNS caches immediately now that the new interface is ready
+# This closes the gap between WiFi reconnect and VPN reconnect
+resolvectl flush-caches 2>/dev/null || true
+resolvectl reset-server-features 2>/dev/null || true
+log_msg "Flushed DNS caches and reset server features"
 
 sleep 1
 if [ "$ENABLE_DTLS" = "true" ]; then
