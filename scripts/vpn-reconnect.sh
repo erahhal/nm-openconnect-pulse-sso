@@ -48,7 +48,9 @@ if [ -n "$VPN_SERVER" ]; then
         done
 
         if [ "$FOUND_ROUTE" = "0" ]; then
-            echo "No active physical interface found for VPN route"
+            echo "No active physical interface found for VPN route, skipping reconnect"
+            echo "nm-dispatcher will handle reconnection when interface comes up"
+            exit 0
         fi
     fi
 fi
