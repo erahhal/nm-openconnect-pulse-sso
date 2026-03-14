@@ -91,10 +91,19 @@ let
     }} $out/bin/diagnose-nm-pulse-vpn
   '';
 
-  # VPN reconnect script (for post-resume.target)
+  # VPN reconnect script (for post-resume.target) — kills stale openconnect, triggers auto-reconnect
   vpn-reconnect-script = pkgs.runCommand "vpn-reconnect" { } ''
     install -Dm755 ${pkgs.replaceVars ./scripts/vpn-reconnect.sh {
-      inherit (pkgs) procps dnsutils gnugrep iproute2 gawk;
+      inherit (pkgs) procps systemd;
+    }} $out
+  '';
+
+  # VPN auto-reconnect script — uses nmcli to re-establish VPN with retries
+  vpn-auto-reconnect-script = pkgs.runCommand "vpn-auto-reconnect" { } ''
+    install -Dm755 ${pkgs.replaceVars ./scripts/vpn-auto-reconnect.sh {
+      inherit (pkgs) procps coreutils networkmanager systemd gawk libnotify util-linux;
+      sudo = pkgs.sudo;
+      vpnName = cfg.vpnName;
     }} $out
   '';
 
@@ -110,8 +119,13 @@ let
   # NetworkManager dispatcher script
   nm-dispatcher-script = pkgs.runCommand "nm-dispatcher" { } ''
     install -Dm755 ${pkgs.replaceVars ./scripts/nm-dispatcher.sh {
-      inherit (pkgs) procps coreutils dnsutils gnugrep iproute2 gawk networkmanager;
+      inherit (pkgs) procps coreutils iproute2 gawk systemd;
     }} $out
+  '';
+
+  # vpnc hook to set auto-reconnect flag on VPN connection
+  vpnc-post-connect-auto-reconnect-flag = pkgs.runCommand "vpnc-post-connect-auto-reconnect-flag" { } ''
+    install -Dm755 ${./scripts/vpnc/post-connect-auto-reconnect-flag.sh} $out
   '';
 
   # vpnc hook scripts
@@ -173,10 +187,8 @@ in
       default = true;
       description = ''
         Enable DTLS/ESP for better VPN performance (UDP instead of TCP).
-        When enabled, uses full restart instead of SIGUSR2 for reconnection
-        after suspend/resume or network changes. If the cookie is invalidated,
-        the browser will open for re-authentication.
-        When disabled, uses --no-dtls for reliable SIGUSR2 reconnection.
+        Reconnection after suspend/resume or network changes is handled
+        externally by the vpn-auto-reconnect service via nmcli.
 
         DTLS is generally more stable and recommended.
       '';
@@ -311,16 +323,29 @@ in
       };
     };
 
-    # Systemd service to reconnect VPN after system resume
+    # Systemd service to kill stale openconnect after resume and trigger auto-reconnect
     systemd.services.vpn-reconnect = lib.mkIf cfg.enableRecovery {
-      description = "Reconnect VPN after system resume";
+      description = "Kill stale VPN after resume and trigger auto-reconnect";
       wantedBy = [ "post-resume.target" ];
-      wants = [ "network-online.target" ];
-      after = [ "post-resume.target" "network-online.target" ];
+      after = [ "post-resume.target" ];
 
       serviceConfig = {
         Type = "oneshot";
         ExecStart = vpn-reconnect-script;
+      };
+    };
+
+    # External VPN auto-reconnect service — uses nmcli (same as a user would)
+    # Triggered by: vpn-reconnect (post-resume), nm-dispatcher (network change)
+    systemd.services.vpn-auto-reconnect = lib.mkIf cfg.enableRecovery {
+      description = "Auto-reconnect VPN via nmcli";
+      after = [ "network-online.target" "NetworkManager.service" ];
+      wants = [ "network-online.target" ];
+
+      serviceConfig = {
+        Type = "oneshot";
+        ExecStart = vpn-auto-reconnect-script;
+        TimeoutStartSec = 120;
       };
     };
 
@@ -360,6 +385,12 @@ in
     environment.etc."vpnc/reconnect.d/narrow-docker-route" = lib.mkIf cfg.enableRecovery {
       mode = "0755";
       source = vpnc-reconnect-narrow-docker;
+    };
+
+    # vpnc hook to set auto-reconnect flag on VPN connection
+    environment.etc."vpnc/post-connect.d/00-auto-reconnect-flag" = lib.mkIf cfg.enableRecovery {
+      mode = "0755";
+      source = vpnc-post-connect-auto-reconnect-flag;
     };
 
     # vpnc hook to flush DNS caches after VPN connection

@@ -19,14 +19,17 @@ import logging
 import os
 import pwd
 import signal
+import socket
 import subprocess
 import sys
+
 from argparse import ArgumentParser, Namespace
 from enum import IntEnum
 from functools import wraps
 from pathlib import Path
 from subprocess import PIPE, Popen
 from typing import Any, Optional
+from urllib.parse import urlparse
 
 import dbus
 import dbus.mainloop.glib
@@ -46,8 +49,8 @@ def is_dtls_enabled() -> bool:
     """
     Check if DTLS/ESP is enabled by reading the NixOS config file.
 
-    Returns True if DTLS is enabled (better performance, full restart on reconnect).
-    Returns False if DTLS is disabled (uses --no-dtls, SIGUSR2 reconnect).
+    Returns True if DTLS is enabled (better performance, UDP/ESP tunnel).
+    Returns False if DTLS is disabled (uses --no-dtls, TCP/SSL only).
     """
     try:
         if CONFIG_PATH.exists():
@@ -185,9 +188,6 @@ class PulseSSOPlugin(dbus.service.Object):
         # Child watch source ID for cleanup
         self._child_watch_id: Optional[int] = None
 
-        # Pending restart timeout ID (to cancel if connection succeeds)
-        self._restart_timeout_id: Optional[int] = None
-
         # Count consecutive auth failures to prevent infinite loops
         self._auth_failure_count: int = 0
 
@@ -195,13 +195,10 @@ class PulseSSOPlugin(dbus.service.Object):
         # browser re-auth (prevents race with NM calling Disconnect after StateChanged)
         self._reconnection_pending: bool = False
 
-        # Retry tracking for reconnection attempts (nm-applet may not be ready after suspend)
+        # Retry tracking for auth dialog attempts (nm-applet may not be ready after suspend)
         self._reconnection_retry_count: int = 0
         self._max_reconnection_retries: int = 10
         self._reconnection_retry_interval: int = 3000  # milliseconds
-
-        # Track the last cookie rejected by the server to avoid tight restart loops
-        self._last_failed_cookie: Optional[str] = None
 
         # Track any pending direct-auth timer (GLib source ID) to prevent duplicates
         self._direct_auth_timeout_id: Optional[int] = None
@@ -216,10 +213,9 @@ class PulseSSOPlugin(dbus.service.Object):
         self._auth_launch_index: int = 0
         self._auth_input_data: bytes = b""
 
-        # Track secrets request timeout - if NM's agent doesn't respond, fall back to direct auth
-        # This handles cases where plasma-nm or other agents don't support our VPN type
-        self._secrets_timeout_id: Optional[int] = None
-        self._secrets_timeout_ms: int = 5000  # 5 seconds to wait for secrets agent
+        # Idle quit timeout — quit service if no Connect() received within 5 minutes
+        # after a reactive disconnect (keeps cookie alive for external reconnect)
+        self._idle_quit_timeout_id: Optional[int] = None
 
     def _do_connect(self, connection: dict):
         """
@@ -250,17 +246,6 @@ class PulseSSOPlugin(dbus.service.Object):
             if not gateway.startswith("http://") and not gateway.startswith("https://"):
                 gateway = f"https://{gateway}"
 
-            if self._last_failed_cookie and cookie == self._last_failed_cookie:
-                logger.warning(
-                    "Provided cookie matches last failed cookie; deferring until new credentials arrive"
-                )
-                self._ensure_direct_auth("stale cookie from NetworkManager", delay_ms=0)
-                return
-
-            if self._last_failed_cookie and cookie != self._last_failed_cookie:
-                logger.debug("Received new cookie, clearing failed-cookie tracker")
-                self._last_failed_cookie = None
-
             logger.info("Starting openconnect for gateway: %s", gateway)
             self.StateChanged(ServiceState.Starting)
 
@@ -284,6 +269,81 @@ class PulseSSOPlugin(dbus.service.Object):
             self.StateChanged(ServiceState.Stopped)
             raise LaunchFailedError(f"Connection failed: {e}")
 
+    def _cleanup_stale_vpn_routes(self):
+        """Remove stale static routes to the VPN server from previous connections.
+
+        When openconnect dies without a graceful disconnect (crash, SIGKILL,
+        network loss), vpnc-script's del_vpngateway_route() never runs,
+        leaving static routes that point to an old gateway. These stale
+        routes prevent reaching the VPN server on the new network.
+        """
+        if not self.gateway:
+            return
+
+        try:
+            hostname = urlparse(self.gateway).hostname or self.gateway
+        except Exception:
+            hostname = self.gateway
+
+        try:
+            # Use a short timeout — after resume, DNS may be unavailable.
+            # Route cleanup is best-effort; don't block for 20s on stale DNS.
+            old_timeout = socket.getdefaulttimeout()
+            socket.setdefaulttimeout(3)
+            try:
+                vpn_ip = socket.gethostbyname(hostname)
+            finally:
+                socket.setdefaulttimeout(old_timeout)
+        except Exception as e:
+            logger.debug("Cannot resolve %s for route cleanup: %s", hostname, e)
+            return
+
+        try:
+            result = subprocess.run(
+                ["ip", "route", "show", vpn_ip],
+                capture_output=True, text=True, timeout=5,
+            )
+            if not result.stdout.strip():
+                return
+
+            def_result = subprocess.run(
+                ["ip", "route", "show", "default"],
+                capture_output=True, text=True, timeout=5,
+            )
+            default_gw = None
+            for line in def_result.stdout.strip().split("\n"):
+                if "via" in line and "tun" not in line:
+                    parts = line.split()
+                    via_idx = parts.index("via")
+                    default_gw = parts[via_idx + 1]
+                    break
+
+            if not default_gw:
+                return
+
+            for line in result.stdout.strip().split("\n"):
+                if "proto static" in line and "via" in line:
+                    parts = line.split()
+                    via_idx = parts.index("via")
+                    route_gw = parts[via_idx + 1]
+                    if route_gw != default_gw:
+                        logger.info(
+                            "Removing stale VPN route: %s via %s "
+                            "(current default gw: %s)",
+                            vpn_ip, route_gw, default_gw,
+                        )
+                        subprocess.run(
+                            ["ip", "route", "del", vpn_ip],
+                            capture_output=True, timeout=5,
+                        )
+                        subprocess.run(
+                            ["ip", "route", "del", route_gw],
+                            capture_output=True, timeout=5,
+                        )
+                        break
+        except Exception as e:
+            logger.debug("Route cleanup failed (non-fatal): %s", e)
+
     def _start_openconnect(self):
         """
         Start openconnect with the current cookie.
@@ -291,17 +351,31 @@ class PulseSSOPlugin(dbus.service.Object):
         This is called both for initial connection and for restarts after
         unexpected exits (non-auth failures).
         """
+        # Flush DNS caches — after suspend/resume, caches may contain stale
+        # entries that cause immediate getaddrinfo failures for the VPN host.
+        try:
+            subprocess.run(
+                ["resolvectl", "flush-caches"],
+                capture_output=True, timeout=5,
+            )
+            subprocess.run(
+                ["resolvectl", "reset-server-features"],
+                capture_output=True, timeout=5,
+            )
+            logger.debug("Flushed DNS caches before openconnect start")
+        except Exception as e:
+            logger.debug("DNS cache flush failed (non-fatal): %s", e)
+
+        self._cleanup_stale_vpn_routes()
         # Build openconnect command based on working openconnect-pulse-launcher
         # Key differences from CLI version:
         # - No -b (background): we need to track the process for disconnect
         # - Using --script with helper that CALLS vpnc-script AND reports to D-Bus
         #
         # DTLS/ESP handling:
-        # - With DTLS disabled (default): --no-dtls forces SSL-only mode.
-        #   Required for SIGUSR2 reconnection after suspend/resume to work.
-        #   Pulse ESP reconnect is broken: https://gitlab.com/openconnect/openconnect/-/issues/141
-        # - With DTLS enabled: No --no-dtls flag, uses ESP/UDP for better performance.
-        #   Reconnection uses SIGTERM (full restart) instead of SIGUSR2.
+        # - With DTLS disabled: --no-dtls forces SSL-only mode (TCP only).
+        # - With DTLS enabled: uses ESP/UDP for better performance.
+        # Reconnection is handled externally by vpn-auto-reconnect service via nmcli.
         dtls_enabled = is_dtls_enabled()
         logger.info("DTLS/ESP mode: %s", "enabled" if dtls_enabled else "disabled")
 
@@ -369,11 +443,10 @@ class PulseSSOPlugin(dbus.service.Object):
         """
         Called by GLib when openconnect process exits.
 
-        If the exit was unexpected (not from Disconnect()) and we have a valid
-        cookie, restart openconnect. Only re-authenticate on exit code 2.
+        Simplified: just emit Stopped and let external vpn-auto-reconnect
+        service handle re-establishing the VPN via nmcli. No restart logic.
         """
         # Only handle exit for the process we're currently tracking
-        # This prevents stale exit events from old processes triggering restarts
         if self.proc is None or self.proc.pid != pid:
             logger.debug(
                 "Ignoring exit for old process PID %d (current: %s)",
@@ -396,101 +469,41 @@ class PulseSSOPlugin(dbus.service.Object):
         self.proc = None
         self._child_watch_id = None
 
-        # If disconnect was requested, don't restart
+        # If disconnect was requested, don't do anything — Disconnect() handles cleanup
         if self._disconnect_requested:
             logger.info("Disconnect was requested, not restarting")
             return
 
-        # Exit code 2 means auth failure - cookie is invalid
+        # Exit code 2 means auth failure — cookie is invalid
         if exit_code == 2:
-            logger.error("openconnect auth failure (exit code 2) - cookie invalid")
-            failed_cookie = self.cookie
+            logger.warning("Auth failure (exit code 2) — cookie invalid, clearing")
             self.cookie = None
-
-            if failed_cookie:
-                logger.debug("Tracking failed cookie to avoid reuse")
-                self._last_failed_cookie = failed_cookie
-
-            # Count consecutive auth failures to prevent infinite loops
-            self._auth_failure_count += 1
-            logger.info("Auth failure count: %d", self._auth_failure_count)
-
-            if self._auth_failure_count > 3:
-                logger.error(
-                    "Too many consecutive auth failures (%d), giving up",
-                    self._auth_failure_count,
-                )
-                self.StateChanged(ServiceState.Stopped)
-                self.Failure(
-                    "Authentication failed repeatedly - please reconnect manually"
-                )
-                return
-
-            if self.gateway and not self._disconnect_requested:
-                # Cookie expired - need to re-authenticate via browser
-                # Note: SecretsRequired doesn't work here because it's only valid
-                # during an ongoing ConnectInteractive() call, and NM's agent
-                # system doesn't respond after suspend/resume anyway.
-                logger.info(
-                    "Cookie expired, launching direct auth for gateway: %s",
-                    self.gateway,
-                )
-                # Set flag to prevent Disconnect() from quitting during reconnection
-                self._reconnection_pending = True
-                # Emit Starting (not Stopped) so NM knows we're reconnecting
-                # If we emit Stopped, NM tears down the connection and nm-applet shows disconnected
-                self.StateChanged(ServiceState.Starting)
-                # Launch auth-dialog directly (bypasses NM's broken agent system)
-                self._schedule_direct_auth(1000)
-            else:
-                logger.error("Cannot reconnect - no gateway or disconnect requested")
-                self.StateChanged(ServiceState.Stopped)
-                self.Failure("Authentication failed - cookie expired")
-            return
-
-        # Non-auth failure with valid cookie - restart
-        if self.cookie and self.gateway:
-            logger.warning(
-                "openconnect exited unexpectedly, restarting in 2 seconds..."
-            )
-            # Signal that we're reconnecting so nm-applet doesn't clear VPN icon
-            self.StateChanged(ServiceState.Starting)
-            # Small delay to avoid tight restart loop
-            # Track timeout ID so we can cancel if connection succeeds before timeout fires
-            self._restart_timeout_id = GLib.timeout_add(2000, self._do_restart)
         else:
-            logger.error("Cannot restart - no cookie or gateway")
-            self.StateChanged(ServiceState.Stopped)
-
-    def _do_restart(self) -> bool:
-        """
-        Actually restart openconnect (called from GLib timeout).
-
-        Returns False to prevent the timeout from repeating.
-        """
-        # Clear the timeout ID since we're now executing
-        self._restart_timeout_id = None
-
-        # Double-check we still should restart
-        if self._disconnect_requested:
             logger.info(
-                "Disconnect was requested during restart delay, aborting restart"
+                "Unexpected exit (code %d) — keeping cookie for reconnect",
+                exit_code,
             )
-            return False
 
-        if not self.cookie or not self.gateway:
-            logger.error("Cannot restart - credentials cleared")
-            self.StateChanged(ServiceState.Stopped)
-            return False
+        # Emit Stopped — NM will call Disconnect() reactively, and
+        # external vpn-auto-reconnect service handles re-establishing
+        self.StateChanged(ServiceState.Stopped)
 
-        logger.info("Restarting openconnect with existing cookie")
-        try:
-            self._start_openconnect()
-        except Exception as e:
-            logger.exception("Failed to restart openconnect: %s", e)
-            self.StateChanged(ServiceState.Stopped)
+    def _on_idle_quit_timeout(self) -> bool:
+        """Quit service after 5 minutes of inactivity (no Connect() received).
 
-        return False  # Don't repeat the timeout
+        After a reactive disconnect, we stay alive to retain the cookie.
+        If no Connect() comes within 5 minutes, quit to release resources.
+
+        Returns False to prevent GLib timeout from repeating.
+        """
+        self._idle_quit_timeout_id = None
+        if self.proc is not None:
+            return False  # VPN is running, don't quit
+        logger.info("No reconnection after 5 minutes — quitting service")
+        self.cookie = None
+        self.gateway = None
+        self.loop.quit()
+        return False
 
     def _schedule_auth_retry(self, reason: str):
         """
@@ -560,90 +573,6 @@ class PulseSSOPlugin(dbus.service.Object):
             GLib.source_remove(self._auth_dialog_timeout_id)
             self._auth_dialog_timeout_id = None
 
-    def _schedule_secrets_timeout(self):
-        """
-        Schedule a fallback to direct auth if no secrets arrive.
-
-        This handles cases where the desktop's secrets agent (e.g., plasma-nm)
-        doesn't know how to get secrets for our VPN type.
-        """
-        self._cancel_secrets_timeout()
-        logger.info(
-            "Scheduling secrets timeout (%dms) - will fall back to direct auth if no response",
-            self._secrets_timeout_ms,
-        )
-        self._secrets_timeout_id = GLib.timeout_add(
-            self._secrets_timeout_ms, self._on_secrets_timeout
-        )
-
-    def _cancel_secrets_timeout(self):
-        """Cancel any pending secrets timeout."""
-        if self._secrets_timeout_id is not None:
-            GLib.source_remove(self._secrets_timeout_id)
-            self._secrets_timeout_id = None
-
-    def _on_secrets_timeout(self) -> bool:
-        """
-        Called when secrets timeout expires - fall back to direct auth.
-
-        This handles cases where plasma-nm or other agents don't support
-        our VPN type and can't provide secrets.
-
-        Returns False to prevent GLib timeout from repeating.
-        """
-        self._secrets_timeout_id = None
-
-        # Check if we still need secrets (NewSecrets wasn't called)
-        if self.pending_connection is None:
-            logger.debug("Secrets timeout fired but no pending connection - ignoring")
-            return False
-
-        if self.proc is not None:
-            logger.debug("Secrets timeout fired but already connected - ignoring")
-            return False
-
-        logger.info(
-            "Secrets agent did not respond in time, falling back to direct auth"
-        )
-
-        # Extract gateway from pending connection for direct auth
-        vpn_data = self.pending_connection.get("vpn", {}).get("data", {})
-        gateway = vpn_data.get("gateway", "")
-
-        if not gateway:
-            logger.error("No gateway in pending connection, cannot do direct auth")
-            self.StateChanged(ServiceState.Stopped)
-            self.Failure("No VPN gateway configured")
-            self.pending_connection = None
-            return False
-
-        # Ensure gateway has https:// prefix
-        if not gateway.startswith("http://") and not gateway.startswith("https://"):
-            gateway = f"https://{gateway}"
-
-        # Set up for direct auth
-        self.gateway = gateway
-        self._reconnection_pending = True
-        self._reconnection_retry_count = 0
-
-        # Launch direct auth (will open browser)
-        self._schedule_direct_auth(0)
-
-        return False
-
-    def _ensure_direct_auth(self, reason: str, delay_ms: int = 0):
-        """
-        Ensure the direct auth flow is scheduled (used when NM hands us a stale cookie).
-        """
-        if not self._reconnection_pending:
-            logger.info("Scheduling direct auth (%s)", reason)
-        else:
-            logger.info("Direct auth already pending (%s) - refreshing timer", reason)
-
-        self._reconnection_pending = True
-        self.StateChanged(ServiceState.Starting)
-        self._schedule_direct_auth(delay_ms)
-
     def _launch_direct_auth(self) -> bool:
         """
         Launch auth-dialog directly, bypassing NM's agent system.
@@ -659,6 +588,9 @@ class PulseSSOPlugin(dbus.service.Object):
         """
         # GLib invoked this callback; clear the stored source ID
         self._direct_auth_timeout_id = None
+
+        # Clean up stale routes so auth browser can reach VPN server
+        self._cleanup_stale_vpn_routes()
 
         if not self._reconnection_pending:
             logger.debug("Reconnection no longer pending, skipping direct auth")
@@ -1031,13 +963,11 @@ class PulseSSOPlugin(dbus.service.Object):
         logger.info("Got fresh cookie from auth-dialog, starting openconnect")
         self.cookie = cookie
         self.servercert = gwcert
-        self._last_failed_cookie = None
 
         self.StateChanged(ServiceState.Starting)
         try:
             self._start_openconnect()
             # Only clear reconnection state AFTER openconnect starts successfully
-            # This ensures retries work if _start_openconnect() fails
             self._reconnection_pending = False
             self._reconnection_retry_count = 0
             self._auth_failure_count = 0
@@ -1060,9 +990,25 @@ class PulseSSOPlugin(dbus.service.Object):
         connection = convert_dbus_types(connection)
         logger.info("Connect called with connection: %s", connection)
 
+        # Cancel idle quit timer — we got a Connect call
+        if self._idle_quit_timeout_id is not None:
+            GLib.source_remove(self._idle_quit_timeout_id)
+            self._idle_quit_timeout_id = None
+        self._disconnect_requested = False
+
         vpn_secrets = connection.get("vpn", {}).get("secrets", {})
         if not vpn_secrets.get("cookie"):
-            # No cookie - launch direct auth (browser popup)
+            # No cookie from NM — check if we have one internally from previous connection
+            if self.cookie:
+                logger.info("No cookie from NM, using internally-stored cookie")
+                # Inject into connection dict for _do_connect
+                connection.setdefault("vpn", {}).setdefault("secrets", {})["cookie"] = self.cookie
+                if self.servercert:
+                    connection["vpn"]["secrets"]["gwcert"] = self.servercert
+                self._do_connect(connection)
+                return
+
+            # No cookie at all - launch direct auth (browser popup)
             logger.info("No cookie in Connect, launching direct auth")
 
             # Extract gateway from connection
@@ -1104,6 +1050,12 @@ class PulseSSOPlugin(dbus.service.Object):
         connection = convert_dbus_types(connection)
         logger.info("ConnectInteractive called with connection: %s", connection)
 
+        # Cancel idle quit timer — we got a Connect call
+        if self._idle_quit_timeout_id is not None:
+            GLib.source_remove(self._idle_quit_timeout_id)
+            self._idle_quit_timeout_id = None
+        self._disconnect_requested = False
+
         # Store connection for later use
         self.pending_connection = connection
 
@@ -1115,14 +1067,17 @@ class PulseSSOPlugin(dbus.service.Object):
         vpn_data = connection.get("vpn", {}).get("data", {})
         gateway = vpn_data.get("gateway", "")
 
-        if cookie and self._last_failed_cookie and cookie == self._last_failed_cookie:
-            logger.info(
-                "ConnectInteractive received stale cookie, triggering direct auth"
-            )
-            cookie = ""  # Treat as no cookie
-
         if not cookie:
-            # No cookie - trigger direct auth immediately
+            # No cookie from NM — check if we have one internally from previous connection
+            if self.cookie:
+                logger.info("ConnectInteractive: No cookie from NM, using internally-stored cookie")
+                connection.setdefault("vpn", {}).setdefault("secrets", {})["cookie"] = self.cookie
+                if self.servercert:
+                    connection["vpn"]["secrets"]["gwcert"] = self.servercert
+                self._do_connect(connection)
+                return
+
+            # No cookie at all - trigger direct auth immediately
             # Don't emit SecretsRequired to avoid plasma-nm showing a dialog
             logger.info("No cookie, triggering direct auth immediately")
 
@@ -1173,47 +1128,46 @@ class PulseSSOPlugin(dbus.service.Object):
         """
         Stop VPN connection.
 
-        Called by NetworkManager when user requests disconnection.
+        Called by NetworkManager when user requests disconnection OR reactively
+        when NM detects the tunnel (tun0) has died.
+
+        Key insight: when openconnect dies, _on_openconnect_exit() fires FIRST
+        (via SIGCHLD/GLib child_watch), setting self.proc = None. NM's reactive
+        Disconnect() arrives later over D-Bus. When the USER clicks disconnect,
+        NM calls Disconnect() while self.proc is still running (not None).
+
+        - proc is not None → user-initiated disconnect → remove flag file, quit
+        - proc is None → reactive disconnect → stay alive with cookie for reconnect
         """
         logger.info("Disconnect called")
 
-        # If reconnection is in progress, clean up but keep the service alive.
-        # NM's state machine may call Disconnect() in reaction to our
-        # StateChanged(Starting) during reconnection.  If we quit here, NM
-        # would have to D-Bus-activate a fresh service to reconnect, which
-        # can cause flapping or total loss of connectivity.  By staying
-        # alive we allow NM to call Connect() again on the same instance.
-        if self._reconnection_pending:
-            logger.info("Disconnect called during reconnection, cleaning up")
-            self._disconnect_requested = True
-            self._reconnection_pending = False
-            self._reconnection_retry_count = 0
-
-            # Cancel any pending auth timer and kill running auth-dialog
-            self._cancel_direct_auth_timer()
-            self._cancel_secrets_timeout()
-            self._kill_auth_dialog()
-
-            self.StateChanged(ServiceState.Stopped)
-            return
-
-        # Mark that disconnect was requested - prevents auto-restart
-        self._disconnect_requested = True
-
-        # Clear credentials and pending state to prevent restart
-        self.cookie = None
-        self.gateway = None
-        self._last_failed_cookie = None
-        self.pending_connection = None
-        self._cancel_direct_auth_timer()
-        self._cancel_secrets_timeout()
-
         if self.proc is not None:
+            # User/NM initiated disconnect while VPN is running
+            logger.info("User-initiated disconnect — removing auto-reconnect flag")
+            self._disconnect_requested = True
+
+            # Remove flag file so external service doesn't reconnect
+            try:
+                os.unlink("/run/vpn-auto-reconnect")
+            except FileNotFoundError:
+                pass
+
+            # Cancel any pending auth
+            self._cancel_direct_auth_timer()
+            self._kill_auth_dialog()
+            self._reconnection_pending = False
+
+            # Clear credentials
+            self.cookie = None
+            self.gateway = None
+            self.pending_connection = None
+
+            # Kill openconnect
             logger.info("Terminating openconnect process %d", self.proc.pid)
             self.proc.terminate()
             try:
                 self.proc.wait(timeout=5)
-            except:
+            except Exception:
                 logger.warning("Process did not terminate, killing")
                 self.proc.kill()
                 self.proc.wait()
@@ -1221,16 +1175,30 @@ class PulseSSOPlugin(dbus.service.Object):
             logger.info("openconnect exit code: %d", self.proc.returncode)
             self.proc = None
 
-        # Clear cached VPN secrets so next connect gets fresh auth
-        # The cookie becomes invalid after disconnect, so we need to
-        # force re-authentication on the next connect
-        self._clear_cached_secrets()
+            self._clear_cached_secrets()
+            self.StateChanged(ServiceState.Stopped)
 
-        self.StateChanged(ServiceState.Stopped)
+            # Exit the service - NM will restart it when needed
+            logger.info("Stopping service event loop")
+            self.loop.quit()
+        else:
+            # Reactive disconnect — openconnect already exited
+            # Stay alive to retain cookie for when NM calls Connect() again
+            # (triggered by external vpn-auto-reconnect service via nmcli)
+            logger.info("Reactive disconnect — staying alive with cookie for reconnect")
 
-        # Exit the service - NM will restart it when needed
-        logger.info("Stopping service event loop")
-        self.loop.quit()
+            # Cancel any pending auth
+            self._cancel_direct_auth_timer()
+            self._kill_auth_dialog()
+            self._reconnection_pending = False
+
+            # Don't emit Stopped again (exit handler already did)
+            # Set idle timeout — quit if no Connect() comes within 5 minutes
+            if self._idle_quit_timeout_id is not None:
+                GLib.source_remove(self._idle_quit_timeout_id)
+            self._idle_quit_timeout_id = GLib.timeout_add(
+                300000, self._on_idle_quit_timeout
+            )
 
     def _clear_cached_secrets(self):
         """Clear cached VPN secrets from NetworkManager via D-Bus."""
@@ -1245,7 +1213,7 @@ class PulseSSOPlugin(dbus.service.Object):
                 nm, "org.freedesktop.NetworkManager.Settings"
             )
 
-            # Find our connection by name
+            # Find our connection by service type
             for conn_path in settings_iface.ListConnections():
                 conn = bus.get_object("org.freedesktop.NetworkManager", conn_path)
                 conn_settings = dbus.Interface(
@@ -1253,14 +1221,15 @@ class PulseSSOPlugin(dbus.service.Object):
                 )
                 settings = conn_settings.GetSettings()
 
-                conn_id = settings.get("connection", {}).get("id", "")
-                if conn_id == "Pulse VPN":
+                conn_type = settings.get("connection", {}).get("type", "")
+                vpn_service = settings.get("vpn", {}).get("service-type", "")
+                if conn_type == "vpn" and vpn_service == NM_DBUS_SERVICE:
                     # Clear secrets by calling ClearSecrets()
                     conn_settings.ClearSecrets()
                     logger.info("Cleared cached VPN secrets via D-Bus")
                     return
 
-            logger.warning("Could not find Pulse VPN connection to clear secrets")
+            logger.warning("Could not find VPN connection to clear secrets")
         except Exception as e:
             logger.warning("Failed to clear secrets via D-Bus: %s", e)
 
@@ -1281,30 +1250,19 @@ class PulseSSOPlugin(dbus.service.Object):
         """
         logger.info("SetIp4Config called: %s", config)
 
-        # Cancel any pending restart timeout - we're successfully connected now
-        if self._restart_timeout_id is not None:
-            logger.debug("Canceling pending restart timeout")
-            GLib.source_remove(self._restart_timeout_id)
-            self._restart_timeout_id = None
-
-        # Reset auth failure counter on successful connection
+        # Reset failure counters on successful connection
         if self._auth_failure_count > 0:
             logger.info(
                 "Resetting auth failure count (was %d)", self._auth_failure_count
             )
             self._auth_failure_count = 0
 
-        # Reset reconnection retry counter on successful connection
         if self._reconnection_retry_count > 0:
             logger.info(
                 "Resetting reconnection retry count (was %d)",
                 self._reconnection_retry_count,
             )
             self._reconnection_retry_count = 0
-
-        if self._last_failed_cookie is not None:
-            logger.debug("Clearing last failed cookie after successful connection")
-            self._last_failed_cookie = None
 
         self._cancel_direct_auth_timer()
 
@@ -1339,9 +1297,6 @@ class PulseSSOPlugin(dbus.service.Object):
         After SecretsRequired is emitted, NM runs the auth-dialog and
         sends the collected secrets here.
         """
-        # Cancel secrets timeout - we got a response from an agent
-        self._cancel_secrets_timeout()
-
         connection = convert_dbus_types(connection)
         logger.info("NewSecrets called with: %s", connection)
 

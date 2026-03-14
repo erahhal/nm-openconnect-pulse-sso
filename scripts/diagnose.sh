@@ -65,6 +65,8 @@ run_cmd() {
 
     run_cmd "Default routes" @iproute2@/bin/ip route show default
 
+    run_cmd "Static routes (check for stale VPN server routes)" @iproute2@/bin/ip route show proto static
+
     section "4. DNS CONFIGURATION"
 
     run_cmd "resolv.conf" @coreutils@/bin/cat /etc/resolv.conf
@@ -91,7 +93,9 @@ run_cmd() {
 
     run_cmd "VPN service logs" @systemd@/bin/journalctl --since "${MINUTES} minutes ago" --no-pager -o short-precise | @gnugrep@/bin/grep -iE "(pulse|openconnect)" | head -200 || echo "No matching logs"
 
-    run_cmd "VPN reconnect service logs" @systemd@/bin/journalctl --since "${MINUTES} minutes ago" --no-pager -o short-precise | @gnugrep@/bin/grep -iE "vpn-reconnect" | head -50 || echo "No matching logs"
+    run_cmd "VPN auto-reconnect service logs" @systemd@/bin/journalctl -u vpn-auto-reconnect --since "${MINUTES} minutes ago" --no-pager -o short-precise | head -50 || echo "No matching logs"
+
+    run_cmd "VPN resume service logs" @systemd@/bin/journalctl -u vpn-reconnect --since "${MINUTES} minutes ago" --no-pager -o short-precise | head -50 || echo "No matching logs"
 
     run_cmd "NetworkManager dispatcher logs" @systemd@/bin/journalctl --since "${MINUTES} minutes ago" --no-pager -o short-precise | @gnugrep@/bin/grep -iE "90-vpn-reconnect" | head -50 || echo "No matching logs"
 
@@ -106,6 +110,10 @@ run_cmd() {
     run_cmd "DTLS config" @coreutils@/bin/cat /etc/nm-pulse-sso/config 2>/dev/null || echo "Config file not found"
 
     run_cmd "VPN dispatcher script exists" ls -la /etc/NetworkManager/dispatcher.d/90-vpn-reconnect 2>/dev/null || echo "Dispatcher script not found"
+
+    run_cmd "Auto-reconnect flag file" ls -la /run/vpn-auto-reconnect 2>/dev/null || echo "Flag file not present (VPN auto-reconnect not active)"
+
+    run_cmd "Dispatcher cooldown file" bash -c 'if [ -f /run/vpn-reconnect-last-kill ]; then DATA=$(cat /run/vpn-reconnect-last-kill); TS=$(echo "$DATA" | cut -d: -f1); GW=$(echo "$DATA" | cut -d: -f2); DEV=$(echo "$DATA" | cut -d: -f3); AGO=$(( $(date +%s) - TS )); echo "Last kill: ${AGO}s ago, gateway=$GW, device=$DEV (cooldown: 120s)"; else echo "No cooldown file (no recent dispatcher kills)"; fi'
 
     section "8. CONNECTIVITY TEST"
 

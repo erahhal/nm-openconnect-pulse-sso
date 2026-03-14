@@ -2,8 +2,8 @@
 #
 # NetworkManager Dispatcher Script (90-vpn-reconnect)
 #
-# Fixes VPN route and triggers reconnection when network interface changes.
-# Handles connectivity-change, down, and up events for physical interfaces.
+# Kills openconnect on significant network changes and triggers
+# auto-reconnect via the external vpn-auto-reconnect service.
 
 # Log to both stdout and syslog for debugging
 log_msg() {
@@ -14,12 +14,6 @@ log_msg() {
 # Prevent concurrent execution (rapid WiFi state changes spawn multiple instances)
 exec 9>/run/vpn-reconnect.lock
 flock -n 9 || { log_msg "Another instance already running, exiting"; exit 0; }
-
-# Read DTLS configuration
-ENABLE_DTLS="true"
-if [ -f /etc/nm-pulse-sso/config ]; then
-    . /etc/nm-pulse-sso/config 2>/dev/null || true
-fi
 
 # Act on interface events for physical interfaces
 IFACE="$1"
@@ -45,55 +39,56 @@ case "$IFACE" in
         ;;
 esac
 
-# Check if openconnect is running
+# Check VPN state: is openconnect running? Should VPN be up?
 OPENCONNECT_PID=$(@procps@/bin/pgrep -x openconnect)
-if [ -z "$OPENCONNECT_PID" ]; then
+VPN_SHOULD_BE_UP=""
+if [ -f "/run/vpn-auto-reconnect" ]; then
+    VPN_SHOULD_BE_UP="1"
+fi
+
+# If openconnect not running and VPN not supposed to be up — nothing to do
+if [ -z "$OPENCONNECT_PID" ] && [ -z "$VPN_SHOULD_BE_UP" ]; then
     exit 0
 fi
 
-log_msg "Interface $IFACE action $ACTION - checking VPN route"
-
-# Get VPN server from openconnect command line
-VPN_SERVER=$(@procps@/bin/ps aux | grep '[o]penconnect' | grep -oP 'https://\K[^/]+' | head -1)
-if [ -z "$VPN_SERVER" ]; then
+# If openconnect not running but VPN should be up — just trigger reconnect.
+# This handles: WiFi comes UP after ethernet went DOWN and killed openconnect.
+if [ -z "$OPENCONNECT_PID" ] && [ -n "$VPN_SHOULD_BE_UP" ]; then
+    log_msg "Interface $IFACE action $ACTION — VPN should be up, triggering reconnect"
+    @systemd@/bin/resolvectl flush-caches 2>/dev/null || true
+    @systemd@/bin/resolvectl reset-server-features 2>/dev/null || true
+    @systemd@/bin/systemctl restart --no-block vpn-auto-reconnect.service 2>/dev/null || true
     exit 0
 fi
 
-# Find interface with carrier that has a default route
-# We need the gateway first to use it as DNS server for resolving the VPN hostname
+# openconnect IS running — proceed with kill + reconnect logic
+log_msg "Interface $IFACE action $ACTION - checking VPN"
+
+# Flush DNS caches immediately now that the new interface is ready
+@systemd@/bin/resolvectl flush-caches 2>/dev/null || true
+@systemd@/bin/resolvectl reset-server-features 2>/dev/null || true
+log_msg "Flushed DNS caches and reset server features"
+
+# Find active gateway for cooldown comparison
+TARGET_GW=""
+TARGET_DEV=""
 if [ "$ACTION" = "down" ] || [ "$ACTION" = "connectivity-change" ] || [ -z "$IFACE" ]; then
-    TARGET_DEV=""
-    TARGET_GW=""
     for dev in $(ls /sys/class/net/ | grep -v -E "^(lo|tun|tap|docker|br-|veth)"); do
         if [ -f "/sys/class/net/$dev/carrier" ]; then
             CARRIER=$(cat "/sys/class/net/$dev/carrier" 2>/dev/null || echo "0")
             if [ "$CARRIER" = "1" ] && [ "$dev" != "$IFACE" ]; then
-                for i in $(@coreutils@/bin/seq 1 30); do
-                    GW=$(@iproute2@/bin/ip route show default dev "$dev" 2>/dev/null | @gawk@/bin/awk '{print $3}' | head -1)
-                    if [ -n "$GW" ]; then
-                        TARGET_DEV="$dev"
-                        TARGET_GW="$GW"
-                        log_msg "Found active interface $TARGET_DEV with gateway $TARGET_GW after $i second(s)"
-                        break 2
-                    fi
-                    log_msg "Waiting for gateway on $dev... ($i/30)"
-                    sleep 1
-                done
+                GW=$(@iproute2@/bin/ip route show default dev "$dev" 2>/dev/null | @gawk@/bin/awk '{print $3}' | head -1)
+                if [ -n "$GW" ]; then
+                    TARGET_DEV="$dev"
+                    TARGET_GW="$GW"
+                    break
+                fi
             fi
         fi
     done
 else
     TARGET_DEV="$IFACE"
-    TARGET_GW=""
-    for i in $(@coreutils@/bin/seq 1 30); do
-        TARGET_GW=$(@iproute2@/bin/ip route show default dev "$IFACE" 2>/dev/null | @gawk@/bin/awk '{print $3}' | head -1)
-        if [ -n "$TARGET_GW" ]; then
-            log_msg "Found gateway $TARGET_GW for $IFACE after $i second(s)"
-            break
-        fi
-        log_msg "Waiting for gateway on $IFACE... ($i/30)"
-        sleep 1
-    done
+    TARGET_GW=$(@iproute2@/bin/ip route show default dev "$IFACE" 2>/dev/null | @gawk@/bin/awk '{print $3}' | head -1)
 fi
 
 if [ -z "$TARGET_GW" ] || [ -z "$TARGET_DEV" ]; then
@@ -101,43 +96,33 @@ if [ -z "$TARGET_GW" ] || [ -z "$TARGET_DEV" ]; then
     exit 0
 fi
 
-# Resolve VPN server IP via DNS with retry
-# Use the gateway as DNS server to avoid unreachable VPN DNS servers in /etc/resolv.conf
-VPN_IP=""
-for i in $(@coreutils@/bin/seq 1 30); do
-    VPN_IP=$(@dnsutils@/bin/dig @"$TARGET_GW" +short +timeout=2 "$VPN_SERVER" 2>&1 | @gnugrep@/bin/grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -1)
-    if [ -n "$VPN_IP" ]; then
-        log_msg "Resolved VPN server $VPN_SERVER to $VPN_IP via $TARGET_GW after $i attempt(s)"
-        break
-    fi
-    log_msg "DNS resolution failed for $VPN_SERVER via $TARGET_GW, retrying... ($i/30)"
-    sleep 1
-done
+# Cooldown: don't kill openconnect if we killed it recently on the same network.
+# Transient WiFi glitches cause rapid down/up cycles that would otherwise
+# create a destructive restart loop.
+COOLDOWN_FILE="/run/vpn-reconnect-last-kill"
+COOLDOWN_SECONDS=120
+SKIP_KILL=false
 
-if [ -z "$VPN_IP" ]; then
-    log_msg "Failed to determine VPN server IP - giving up"
-    exit 0
+if [ -f "$COOLDOWN_FILE" ]; then
+    COOLDOWN_DATA=$(cat "$COOLDOWN_FILE" 2>/dev/null || echo "0::")
+    LAST_KILL=$(echo "$COOLDOWN_DATA" | cut -d: -f1)
+    LAST_GW=$(echo "$COOLDOWN_DATA" | cut -d: -f2)
+    LAST_DEV=$(echo "$COOLDOWN_DATA" | cut -d: -f3)
+    NOW=$(@coreutils@/bin/date +%s)
+    ELAPSED=$((NOW - LAST_KILL))
+    if [ "$ELAPSED" -lt "$COOLDOWN_SECONDS" ]; then
+        if [ "$LAST_GW" = "$TARGET_GW" ] && [ "$LAST_DEV" = "$TARGET_DEV" ]; then
+            log_msg "Skipping kill: last restart was ${ELAPSED}s ago (cooldown: ${COOLDOWN_SECONDS}s), same network ($TARGET_DEV/$TARGET_GW)"
+            SKIP_KILL=true
+        else
+            log_msg "Network changed ($LAST_DEV/$LAST_GW -> $TARGET_DEV/$TARGET_GW), bypassing cooldown"
+        fi
+    fi
 fi
 
-# Log current state for debugging
-TUN_STATE=$(@iproute2@/bin/ip -br addr show dev tun0 2>/dev/null || echo "tun0: NOT_FOUND")
-CURRENT_VPN_ROUTE=$(@iproute2@/bin/ip route show "$VPN_IP" 2>/dev/null || echo "no route")
-NM_STATE=$(@networkmanager@/bin/nmcli -t general status 2>/dev/null | head -1 || echo "unknown")
-log_msg "STATE: tun=[$TUN_STATE] vpn_route=[$CURRENT_VPN_ROUTE] nm=[$NM_STATE]"
-
-@iproute2@/bin/ip route del "$VPN_IP" 2>/dev/null || true
-log_msg "Updating route to VPN server $VPN_IP via $TARGET_GW dev $TARGET_DEV"
-@iproute2@/bin/ip route add "$VPN_IP" via "$TARGET_GW" dev "$TARGET_DEV" 2>/dev/null || true
-
-# Flush DNS caches immediately now that the new interface is ready
-# This closes the gap between WiFi reconnect and VPN reconnect
-resolvectl flush-caches 2>/dev/null || true
-resolvectl reset-server-features 2>/dev/null || true
-log_msg "Flushed DNS caches and reset server features"
-
-sleep 1
-if [ "$ENABLE_DTLS" = "true" ]; then
-    log_msg "Sending SIGTERM to openconnect (PID: $OPENCONNECT_PID) for full restart (DTLS mode)"
+if [ "$SKIP_KILL" = "false" ]; then
+    sleep 1
+    log_msg "Sending SIGTERM to openconnect (PID: $OPENCONNECT_PID)"
     kill -TERM "$OPENCONNECT_PID"
     for i in 1 2 3 4 5; do
         sleep 1
@@ -150,7 +135,10 @@ if [ "$ENABLE_DTLS" = "true" ]; then
             kill -9 "$OPENCONNECT_PID" 2>/dev/null || true
         fi
     done
-else
-    log_msg "Sending SIGUSR2 to openconnect (PID: $OPENCONNECT_PID) to force reconnection"
-    kill -USR2 "$OPENCONNECT_PID"
+
+    # Record kill timestamp and network info for cooldown
+    echo "$(@coreutils@/bin/date +%s):${TARGET_GW}:${TARGET_DEV}" > "$COOLDOWN_FILE"
+
+    # Trigger auto-reconnect service (handles waiting for NM, retries, etc.)
+    @systemd@/bin/systemctl start --no-block vpn-auto-reconnect.service 2>/dev/null || true
 fi

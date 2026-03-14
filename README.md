@@ -8,7 +8,7 @@ This plugin provides full NetworkManager integration for Pulse Secure VPNs that 
 
 Key features:
 - CEF (Chromium Embedded Framework) browser with WebAuthn/FIDO2 support (hardware keys like YubiKey)
-- Custom D-Bus VPN service with automatic reconnection after suspend/resume and network changes
+- Custom D-Bus VPN service with external auto-reconnect via systemd (survives suspend/resume and network changes)
 - DTLS/ESP mode for better VPN performance
 - Browser extension support (e.g., Bitwarden password manager)
 - User-agent switching for Okta compatibility
@@ -37,8 +37,9 @@ Key features:
 │  │ nm-pulse-sso-service.py (custom D-Bus VPN plugin)              │  │
 │  │ - Implements org.freedesktop.NetworkManager.VPN.Plugin         │  │
 │  │ - Spawns openconnect with -C <cookie> --protocol=pulse         │  │
-│  │ - Auth failure retry (up to 3 attempts, re-launches browser)   │  │
-│  │ - Reconnection via SIGUSR2 (SSL) or SIGTERM (DTLS)             │  │
+│  │ - On crash: retains cookie, stays alive 5 min for reconnect    │  │
+│  │ - Cleans up stale VPN routes; 5 failures → re-auth             │  │
+│  │ - On user disconnect: removes flag file, clears state, quits   │  │
 │  │                                                                │  │
 │  │   ┌────────────────────────────────────┐                       │  │
 │  │   │ nm-pulse-sso-helper                │                       │  │
@@ -48,10 +49,12 @@ Key features:
 │  │   └────────────────────────────────────┘                       │  │
 │  └────────────────────────────────────────────────────────────────┘  │
 │                                                                      │
-│  Recovery layer (systemd + NM dispatcher):                           │
-│  - vpn-reconnect.sh: post-resume.target service                      │
-│  - nm-dispatcher.sh: interface change handler                        │
-│  - vpnc hooks: default route fixup, Docker route narrowing           │
+│  Recovery layer (external systemd services + NM dispatcher):         │
+│  - vpn-auto-reconnect.sh: reconnect via nmcli (retries, backoff)     │
+│  - vpn-reconnect.sh: post-resume — kill stale openconnect, trigger   │
+│  - nm-dispatcher.sh: interface change — kill or re-trigger reconnect │
+│  - vpnc hooks: auto-reconnect flag, default route fixup, Docker      │
+│  - Flag file: /run/vpn-auto-reconnect tracks desired VPN state       │
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -83,9 +86,13 @@ Responsibilities:
 - Receives `Connect()` / `ConnectInteractive()` calls from NetworkManager with credentials
 - Spawns `openconnect --protocol=pulse -C <cookie>` with the helper script
 - Reads runtime config from `/etc/nm-pulse-sso/config` (DTLS mode, TCP keepalive)
-- Handles openconnect exit codes: auth failures (exit 2) trigger browser re-launch via `systemd-run`; other failures restart openconnect with the existing cookie
-- Auth failure retry: up to 3 consecutive failures before giving up
-- Reconnection retry: up to 10 attempts with 3-second intervals
+- On openconnect crash: retains cookie for reconnect, stays alive with 5-minute idle timeout
+- Cleans up stale VPN server routes before starting openconnect (handles ungraceful exits where routes point to old gateways)
+- After 5 consecutive restart failures, treats the cookie as stale/IP-bound and triggers re-authentication
+- Cooperates with NM's reactive Disconnect() when openconnect dies externally: emits Stopped, then re-activates through NM's ActivateConnection D-Bus API
+- Reuses internally-stored cookie when NM doesn't provide one in Connect()
+- On user disconnect (via NM): removes `/run/vpn-auto-reconnect` flag, clears credentials, quits
+- All primary reconnection is handled externally by `vpn-auto-reconnect.service` via `nmcli connection up`
 - Uses multiple `systemd-run` launch strategies to propagate graphical session environment (Wayland/X11)
 
 ### nm-pulse-sso-helper (openconnect script)
@@ -96,10 +103,15 @@ DNS handling: prepends the local gateway IP to the DNS list and sets VPN DNS pri
 
 ### Recovery Scripts
 
-- **vpn-reconnect.sh** -- systemd service on `post-resume.target`. Waits for network connectivity, fixes the VPN server route to the physical interface, sends SIGUSR2 (non-DTLS) or SIGTERM (DTLS) to openconnect
-- **nm-dispatcher.sh** -- NM dispatcher (`90-vpn-reconnect`) for connectivity-change and interface-down events
-- **vpnc hooks** -- default route fixup and Docker route narrowing on connect/reconnect
+All reconnection goes through `nmcli connection up` via the external auto-reconnect service, avoiding NM plugin state machine conflicts.
+
+- **vpn-auto-reconnect.sh** -- external systemd oneshot service that reconnects VPN via `nmcli connection up`. Checks flag file, waits for network, retries 5 times with increasing backoff, sends desktop notifications
+- **vpn-reconnect.sh** -- systemd service on `post-resume.target`. Kills stale openconnect and triggers `vpn-auto-reconnect.service`
+- **nm-dispatcher.sh** -- NM dispatcher (`90-vpn-reconnect`) for connectivity-change, interface-down, and interface-up events. Kills openconnect first (before route update), uses 120-second cooldown to prevent flapping on transient WiFi glitches, updates VPN server route as best-effort (checks routing table first, falls back to DNS)
+- **vpnc hooks** -- auto-reconnect flag file creation (`/run/vpn-auto-reconnect`), default route fixup, Docker route narrowing
 - **service-restart.sh** -- kills old service process on NixOS rebuild
+
+**Flag file pattern:** `/run/vpn-auto-reconnect` is created on successful VPN connection and removed on user-initiated disconnect. Recovery scripts check this flag to decide whether reconnection is desired.
 
 ### KDE Plasma Plugin
 
@@ -222,12 +234,17 @@ The module automatically:
 - Check DNS configuration and routes in the diagnostic output
 - If using Docker, the vpnc hooks automatically narrow routes to avoid conflicts
 
-### Reconnection after suspend
+### Reconnection after suspend or network change
 - With `enableRecovery = true` (default), the module installs recovery scripts automatically
-- DTLS mode uses full restart (SIGTERM); non-DTLS mode uses graceful reconnect (SIGUSR2)
-- If the cookie has expired, a browser window opens for re-authentication (up to 3 attempts)
+- After suspend/resume: stale openconnect is killed, `vpn-auto-reconnect.service` re-establishes the VPN via `nmcli`
+- On network changes (ethernet→WiFi, interface down/up): same flow — kill openconnect if running, trigger auto-reconnect
+- The plugin retains the authentication cookie for 5 minutes after a crash, so reconnects often succeed without re-authentication
+- After 5 consecutive reconnect failures, the plugin treats the cookie as stale and automatically triggers re-authentication
+- The dispatcher uses a 120-second cooldown to prevent rapid restart loops from transient WiFi glitches
+- The service cleans up stale VPN server routes from previous ungraceful exits before reconnecting
 - `rpfilter` is automatically set to "loose" mode
-- Check `journalctl -u vpn-reconnect` for post-resume logs
+- Check `journalctl -u vpn-auto-reconnect` for reconnect logs
+- Check `journalctl | grep 90-vpn-reconnect` for dispatcher logs
 
 ### Diagnostics
 ```bash
