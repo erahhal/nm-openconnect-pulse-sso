@@ -94,7 +94,7 @@ let
   # VPN reconnect script (for post-resume.target) — kills stale openconnect, triggers auto-reconnect
   vpn-reconnect-script = pkgs.runCommand "vpn-reconnect" { } ''
     install -Dm755 ${pkgs.replaceVars ./scripts/vpn-reconnect.sh {
-      inherit (pkgs) procps systemd;
+      inherit (pkgs) procps;
     }} $out
   '';
 
@@ -110,7 +110,7 @@ let
   # Service restart script
   service-restart-script = pkgs.runCommand "service-restart" { } ''
     install -Dm755 ${pkgs.replaceVars ./scripts/service-restart.sh {
-      inherit (pkgs) procps networkmanager systemd gawk libnotify;
+      inherit (pkgs) procps networkmanager systemd gawk libnotify iproute2 coreutils;
       sudo = pkgs.sudo;
       vpnName = cfg.vpnName;
     }} $out
@@ -247,6 +247,17 @@ in
       '';
     };
 
+    restartBeforeServices = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = [];
+      description = ''
+        Systemd services that should wait for VPN restart to complete
+        before starting. Use this when other services (e.g., home-manager)
+        need VPN access during NixOS rebuild.
+      '';
+      example = [ "home-manager-erahhal.service" ];
+    };
+
     enableSelenium = lib.mkOption {
       type = lib.types.bool;
       default = false;
@@ -354,12 +365,14 @@ in
       description = "Restart nm-pulse-sso-service on package update";
       wantedBy = [ "multi-user.target" ];
       after = [ "network.target" ];
+      before = cfg.restartBeforeServices;
       restartTriggers = [ nm-pulse-sso cfg.enableDtls cfg.enableTcpKeepalive cfg.tcpKeepaliveInterval ];
 
       serviceConfig = {
         Type = "oneshot";
         RemainAfterExit = true;
         ExecStart = service-restart-script;
+        TimeoutStartSec = 120;
       };
     };
 

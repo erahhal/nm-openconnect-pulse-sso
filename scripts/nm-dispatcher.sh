@@ -139,6 +139,8 @@ if [ "$SKIP_KILL" = "false" ]; then
     # Record kill timestamp and network info for cooldown
     echo "$(@coreutils@/bin/date +%s):${TARGET_GW}:${TARGET_DEV}" > "$COOLDOWN_FILE"
 
-    # Trigger auto-reconnect service (handles waiting for NM, retries, etc.)
-    @systemd@/bin/systemctl start --no-block vpn-auto-reconnect.service 2>/dev/null || true
+    # NM re-activation handles reconnection: openconnect exit → NM Disconnect →
+    # _reactivate_vpn_via_nm() calls ActivateConnection in ~1s.
+    # The external vpn-auto-reconnect service is only needed when openconnect
+    # is not running (handled at the top of this script, line 56-61).
 fi

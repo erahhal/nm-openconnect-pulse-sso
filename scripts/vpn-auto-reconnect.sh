@@ -61,6 +61,20 @@ for attempt in 1 2 3 4 5; do
         exit 0
     fi
 
+    # Check if VPN was already reconnected (e.g., by NM re-activation path)
+    if @networkmanager@/bin/nmcli -t -f TYPE,STATE connection show --active 2>/dev/null | grep -q "^vpn:activated$"; then
+        echo "VPN already reconnected (by another path)"
+        for uid in $(@systemd@/bin/loginctl list-users --no-legend | @gawk@/bin/awk '{print $1}'); do
+            RUNTIME_DIR="/run/user/$uid"
+            if [ -S "$RUNTIME_DIR/bus" ]; then
+                @sudo@/bin/sudo -u "#$uid" DBUS_SESSION_BUS_ADDRESS="unix:path=$RUNTIME_DIR/bus" \
+                    @libnotify@/bin/notify-send -i network-vpn "VPN Reconnected" \
+                    "VPN auto-reconnected successfully" 2>/dev/null || true
+            fi
+        done
+        exit 0
+    fi
+
     if @networkmanager@/bin/nmcli connection up "$VPN_NAME" 2>&1; then
         echo "VPN reconnected successfully"
 

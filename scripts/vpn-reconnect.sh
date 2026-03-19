@@ -21,5 +21,7 @@ if @procps@/bin/pgrep -x openconnect >/dev/null 2>&1; then
     fi
 fi
 
-# Trigger auto-reconnect service (runs asynchronously with retries)
-@systemd@/bin/systemctl start --no-block vpn-auto-reconnect.service 2>/dev/null || true
+# NM re-activation handles reconnection: openconnect exit triggers
+# _reactivate_vpn_via_nm() which calls ActivateConnection in ~1s.
+# The external vpn-auto-reconnect service is triggered by the dispatcher
+# if openconnect is not running when a new network interface comes up.

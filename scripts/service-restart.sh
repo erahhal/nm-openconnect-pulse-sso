@@ -30,6 +30,14 @@ if @procps@/bin/pgrep -x openconnect >/dev/null 2>&1; then
     @procps@/bin/pkill -9 -x openconnect || true
 fi
 
+# Write cooldown file so the NM dispatcher doesn't kill openconnect
+# again when interface events fire during NM restart
+TARGET_GW=$(@iproute2@/bin/ip route show default 2>/dev/null | @gawk@/bin/awk '/via/ {print $3; exit}')
+TARGET_DEV=$(@iproute2@/bin/ip route show default 2>/dev/null | @gawk@/bin/awk '/dev/ {for(i=1;i<=NF;i++) if($i=="dev") print $(i+1); exit}')
+if [ -n "$TARGET_GW" ] && [ -n "$TARGET_DEV" ]; then
+    echo "$(@coreutils@/bin/date +%s):${TARGET_GW}:${TARGET_DEV}" > /run/vpn-reconnect-last-kill
+fi
+
 # Reconnect if VPN was active
 if [ -n "$VPN_WAS_ACTIVE" ]; then
     echo "Reconnecting VPN..."
@@ -49,26 +57,39 @@ if [ -n "$VPN_WAS_ACTIVE" ]; then
         fi
     done
 
-    # Background reconnect with retry loop
-    (
-        sleep 3
-        for attempt in 1 2 3 4 5; do
-            echo "VPN reconnect attempt $attempt..."
+    # Synchronous reconnect — blocks until VPN is back or timeout.
+    # This ensures systemd services ordered After=nm-pulse-sso-restart.service
+    # (e.g., home-manager) don't start until VPN is available.
+    sleep 3
+    RECONNECTED=""
+    for attempt in 1 2 3 4 5; do
+        echo "VPN reconnect attempt $attempt..."
+        if @networkmanager@/bin/nmcli connection up "$VPN_NAME" 2>&1; then
+            echo "VPN reconnected successfully"
+            RECONNECTED="1"
             for uid in $(@systemd@/bin/loginctl list-users --no-legend | @gawk@/bin/awk '{print $1}'); do
                 RUNTIME_DIR="/run/user/$uid"
                 if [ -S "$RUNTIME_DIR/bus" ]; then
-                    if @sudo@/bin/sudo -u "#$uid" \
-                        XDG_RUNTIME_DIR="$RUNTIME_DIR" \
-                        DBUS_SESSION_BUS_ADDRESS="unix:path=$RUNTIME_DIR/bus" \
-                        @networkmanager@/bin/nmcli connection up "$VPN_NAME" 2>&1; then
-                        echo "VPN reconnected successfully"
-                        exit 0
-                    fi
+                    @sudo@/bin/sudo -u "#$uid" DBUS_SESSION_BUS_ADDRESS="unix:path=$RUNTIME_DIR/bus" \
+                        @libnotify@/bin/notify-send -i network-vpn "VPN Reconnected" \
+                        "VPN reconnected after NixOS rebuild" 2>/dev/null || true
                 fi
             done
-            echo "Attempt $attempt failed, retrying..."
-            sleep 5
-        done
+            break
+        fi
+        echo "Attempt $attempt failed, retrying in 5s..."
+        sleep 5
+    done
+
+    if [ -z "$RECONNECTED" ]; then
         echo "VPN reconnect failed after 5 attempts"
-    ) &
+        for uid in $(@systemd@/bin/loginctl list-users --no-legend | @gawk@/bin/awk '{print $1}'); do
+            RUNTIME_DIR="/run/user/$uid"
+            if [ -S "$RUNTIME_DIR/bus" ]; then
+                @sudo@/bin/sudo -u "#$uid" DBUS_SESSION_BUS_ADDRESS="unix:path=$RUNTIME_DIR/bus" \
+                    @libnotify@/bin/notify-send -i dialog-warning "VPN Reconnect Failed" \
+                    "Auto-reconnect failed after NixOS rebuild. Please reconnect manually." 2>/dev/null || true
+            fi
+        done
+    fi
 fi
