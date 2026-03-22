@@ -486,6 +486,13 @@ class PulseSSOPlugin(dbus.service.Object):
         if exit_code == 2:
             logger.warning("Auth failure (exit code 2) — cookie invalid, clearing")
             self.cookie = None
+            if self.gateway and not self._disconnect_requested:
+                # Session expired (e.g. 24h server timeout). Set reconnection
+                # pending so NM's reactive Disconnect() schedules re-activation.
+                # NM will call ConnectInteractive() with no cookie, triggering
+                # the direct-auth (browser) path for fresh authentication.
+                logger.info("Setting reconnection pending for re-authentication")
+                self._reconnection_pending = True
             self.StateChanged(ServiceState.Stopped)
             return
 
