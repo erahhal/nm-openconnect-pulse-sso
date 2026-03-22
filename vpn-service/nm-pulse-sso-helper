@@ -46,6 +46,27 @@ def get_env(name, default=''):
     return os.environ.get(name, default)
 
 
+def get_configured_mtu():
+    """Read VPN_MTU cap from /etc/nm-pulse-sso/config, if set.
+
+    Returns the configured MTU ceiling as an integer, or None if not set.
+    Used to cap INTERNAL_IP4_MTU when the VPN server doesn't honor --reqmtu.
+    """
+    config_path = '/etc/nm-pulse-sso/config'
+    try:
+        if os.path.exists(config_path):
+            with open(config_path) as f:
+                for line in f:
+                    line = line.strip()
+                    if line.startswith('VPN_MTU='):
+                        val = line.split('=', 1)[1].strip()
+                        if val:
+                            return int(val)
+    except Exception:
+        pass
+    return None
+
+
 def ip4_to_int(ip_str):
     """Convert IPv4 address string to integer.
 
@@ -178,11 +199,15 @@ def build_ip4_config():
     if netmask:
         config['prefix'] = dbus.UInt32(netmask_to_prefix(netmask))
 
-    # MTU
+    # MTU — capped to configured maximum if VPN_MTU is set in config
     mtu = get_env('INTERNAL_IP4_MTU')
     if mtu:
         try:
-            config['mtu'] = dbus.UInt32(int(mtu))
+            mtu_val = int(mtu)
+            configured_max = get_configured_mtu()
+            if configured_max is not None:
+                mtu_val = min(mtu_val, configured_max)
+            config['mtu'] = dbus.UInt32(mtu_val)
         except ValueError:
             pass
 
@@ -335,7 +360,11 @@ def build_config():
     mtu = get_env('INTERNAL_IP4_MTU')
     if mtu:
         try:
-            config['mtu'] = dbus.UInt32(int(mtu))
+            mtu_val = int(mtu)
+            configured_max = get_configured_mtu()
+            if configured_max is not None:
+                mtu_val = min(mtu_val, configured_max)
+            config['mtu'] = dbus.UInt32(mtu_val)
         except ValueError:
             pass
 

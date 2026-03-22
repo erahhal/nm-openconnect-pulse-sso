@@ -119,7 +119,8 @@ let
   # NetworkManager dispatcher script
   nm-dispatcher-script = pkgs.runCommand "nm-dispatcher" { } ''
     install -Dm755 ${pkgs.replaceVars ./scripts/nm-dispatcher.sh {
-      inherit (pkgs) procps coreutils iproute2 gawk systemd;
+      inherit (pkgs) procps coreutils iproute2 gawk systemd libnotify;
+      sudo = pkgs.sudo;
     }} $out
   '';
 
@@ -222,6 +223,25 @@ in
       description = ''
         TCP keepalive idle interval in seconds. Only used when
         enableTcpKeepalive is true. When null, uses system defaults.
+      '';
+    };
+
+    mtu = lib.mkOption {
+      type = lib.types.nullOr lib.types.ints.positive;
+      default = 1300;
+      description = ''
+        MTU for the VPN tunnel interface. Passed as --mtu to openconnect
+        and enforced as a ceiling on INTERNAL_IP4_MTU in the helper script.
+
+        Default 1300 is a universal safe value: outer ESP packets reach
+        ~1385 bytes (1300 + 85 worst-case overhead), fitting within path
+        MTUs as low as 1385 — covering hotels, airports, mobile hotspots,
+        and VPN-over-VPN setups with ~7% throughput overhead on standard
+        networks.
+
+        Set to null to use the server-provided MTU (typically 1400) for
+        maximum throughput on known-good networks. Decrease further for
+        extremely constrained paths (e.g. 1280 for IPv6-minimum safety).
       '';
     };
 
@@ -364,7 +384,7 @@ in
     systemd.services.nm-pulse-sso-restart = {
       description = "Restart nm-pulse-sso-service on package update";
       wantedBy = [ "multi-user.target" ];
-      after = [ "network.target" ];
+      after = [ "network.target" "NetworkManager.service" ];
       before = cfg.restartBeforeServices;
       restartTriggers = [ nm-pulse-sso cfg.enableDtls cfg.enableTcpKeepalive cfg.tcpKeepaliveInterval ];
 
@@ -431,6 +451,7 @@ in
         ENABLE_DTLS=${if cfg.enableDtls then "true" else "false"}
         ENABLE_TCP_KEEPALIVE=${if cfg.enableTcpKeepalive then "true" else "false"}
         TCP_KEEPALIVE_INTERVAL=${if cfg.tcpKeepaliveInterval != null then toString cfg.tcpKeepaliveInterval else ""}
+        ${lib.optionalString (cfg.mtu != null) "VPN_MTU=${toString cfg.mtu}"}
       '';
     };
 

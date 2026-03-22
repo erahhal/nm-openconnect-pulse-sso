@@ -20,8 +20,11 @@ import os
 import pwd
 import signal
 import socket
+import struct
 import subprocess
 import sys
+import threading
+import time
 
 from argparse import ArgumentParser, Namespace
 from enum import IntEnum
@@ -64,6 +67,27 @@ def is_dtls_enabled() -> bool:
         logger.warning("Failed to read config file %s: %s", CONFIG_PATH, e)
     # Default to DTLS disabled (current behavior)
     return False
+
+
+def get_vpn_mtu() -> "int | None":
+    """
+    Read VPN MTU override from the NixOS config file.
+
+    Returns the configured MTU integer, or None if not set.
+    Used to work around path MTU constraints in restrictive networks.
+    """
+    try:
+        if CONFIG_PATH.exists():
+            content = CONFIG_PATH.read_text()
+            for line in content.splitlines():
+                line = line.strip()
+                if line.startswith("VPN_MTU="):
+                    val = line.split("=", 1)[1].strip()
+                    if val:
+                        return int(val)
+    except Exception as e:
+        logger.warning("Failed to read VPN MTU config: %s", e)
+    return None
 
 
 def get_tcp_keepalive_config() -> tuple:
@@ -191,6 +215,18 @@ class PulseSSOPlugin(dbus.service.Object):
         # Pending NM re-activation timer (to cancel if user disconnects during delay)
         self._reactivation_timeout_id: Optional[int] = None
 
+        # Retry tracking for transient re-activation failures (e.g. "base device
+        # not active" while wlan0 is being promoted as the default route after an
+        # interface change). Reset at the start of each Disconnect() re-activation
+        # sequence so each disconnect gets a fresh 20-second retry window.
+        self._reactivation_retry_count: int = 0
+        self._max_reactivation_retries: int = 10  # ×2s = 20s max window
+
+        # UUID of the VPN connection that was originally activated via
+        # Connect/ConnectInteractive. Used by _reactivate_vpn_via_nm() to
+        # re-activate the correct connection when duplicates exist.
+        self._active_conn_uuid: str = ""
+
         # Count consecutive auth failures to prevent infinite loops
         self._auth_failure_count: int = 0
 
@@ -206,6 +242,12 @@ class PulseSSOPlugin(dbus.service.Object):
         self._reconnection_retry_count: int = 0
         self._max_reconnection_retries: int = 10
         self._reconnection_retry_interval: int = 3000  # milliseconds
+
+        # Total auth failures across re-activation cycles. Unlike
+        # _reconnection_retry_count (which resets per ConnectInteractive),
+        # this persists and caps the total number of attempts to prevent
+        # the infinite NM timeout → re-activate → fail loop.
+        self._total_auth_launch_failures: int = 0
 
         # Track any pending direct-auth timer (GLib source ID) to prevent duplicates
         self._direct_auth_timeout_id: Optional[int] = None
@@ -223,6 +265,105 @@ class PulseSSOPlugin(dbus.service.Object):
         # Idle quit timeout — quit service if no Connect() received within 5 minutes
         # after a reactive disconnect (keeps cookie alive for external reconnect)
         self._idle_quit_timeout_id: Optional[int] = None
+
+        # Cached VPN server IP (from SetConfig gateway field) to avoid
+        # blocking DNS lookups in _cleanup_stale_vpn_routes() on reconnect.
+        self._vpn_server_ip: Optional[str] = None
+
+        # Track whether current connection is a re-activation (for notifications)
+        self._is_reactivation: bool = False
+
+        # Suppress auth-dialog launch during system suspend.
+        # Set by PrepareForSleep(true) from systemd-logind, cleared on resume.
+        self._suspending: bool = False
+
+        # Timestamp of last resume from suspend — used for stabilization delay
+        self._resume_timestamp: float = 0
+
+        # Count system-readiness failures (D-Bus, DNS, network) separately from
+        # auth failures.  These are transient and should not burn the global cap.
+        self._system_not_ready_count: int = 0
+
+        # Strategies that failed with "Transport endpoint is not connected" —
+        # skip them on subsequent attempts to avoid wasted process launches.
+        self._broken_strategies: set = set()
+
+        # Tracks whether all strategies in the current attempt failed with
+        # transient errors (not real auth failures).
+        self._all_strategies_transient: bool = True
+
+        # Subscribe to systemd-logind PrepareForSleep signal to prevent
+        # spurious mid-sleep auth-dialog popups (e.g. when post-resume.target
+        # and a new suspend overlap during a brief s2idle wake cycle).
+        try:
+            login1_proxy = conn.get_object(
+                "org.freedesktop.login1", "/org/freedesktop/login1"
+            )
+            login1_iface = dbus.Interface(
+                login1_proxy, "org.freedesktop.login1.Manager"
+            )
+            login1_iface.connect_to_signal(
+                "PrepareForSleep", self._on_prepare_for_sleep
+            )
+            logger.debug("Subscribed to PrepareForSleep signal from systemd-logind")
+        except Exception as e:
+            logger.warning("Failed to subscribe to PrepareForSleep signal: %s", e)
+
+    def _on_prepare_for_sleep(self, active: bool):
+        """
+        Handle systemd-logind PrepareForSleep signal.
+
+        Called before suspend (active=True) and after resume (active=False).
+        Suppresses auth-dialog launch during the suspend window to prevent
+        spurious popups when a brief s2idle wake is immediately followed
+        by a new suspend.
+        """
+        self._suspending = bool(active)
+        if active:
+            logger.info(
+                "PrepareForSleep: system suspending — suppressing auth-dialog launch"
+            )
+        else:
+            self._resume_timestamp = time.time()
+            logger.info(
+                "PrepareForSleep: system resuming — auth-dialog launch re-enabled"
+            )
+
+    def _send_user_notification(self, title: str, message: str, icon: str = "network-vpn"):
+        """Send a desktop notification to all logged-in users.
+
+        Runs in a background thread to avoid blocking the GLib main loop.
+        """
+        def _notify():
+            try:
+                result = subprocess.run(
+                    ["loginctl", "list-users", "--no-legend"],
+                    capture_output=True, text=True, timeout=5,
+                )
+                for line in result.stdout.strip().splitlines():
+                    parts = line.split()
+                    if not parts:
+                        continue
+                    uid = parts[0]
+                    runtime_dir = f"/run/user/{uid}"
+                    bus_path = f"{runtime_dir}/bus"
+                    if not os.path.exists(bus_path):
+                        continue
+                    subprocess.run(
+                        [
+                            "sudo", "-u", f"#{uid}",
+                            "notify-send", "-i", icon, title, message,
+                        ],
+                        env={
+                            "DBUS_SESSION_BUS_ADDRESS": f"unix:path={bus_path}",
+                            "XDG_RUNTIME_DIR": runtime_dir,
+                        },
+                        capture_output=True, timeout=5,
+                    )
+            except Exception as e:
+                logger.debug("Notification failed (non-fatal): %s", e)
+
+        threading.Thread(target=_notify, daemon=True).start()
 
     def _do_connect(self, connection: dict):
         """
@@ -288,23 +429,26 @@ class PulseSSOPlugin(dbus.service.Object):
         if not self.gateway:
             return
 
-        try:
-            hostname = urlparse(self.gateway).hostname or self.gateway
-        except Exception:
-            hostname = self.gateway
-
-        try:
-            # Use a short timeout — after resume, DNS may be unavailable.
-            # Route cleanup is best-effort; don't block for 20s on stale DNS.
-            old_timeout = socket.getdefaulttimeout()
-            socket.setdefaulttimeout(3)
+        # Use cached IP from previous SetConfig if available — avoids blocking
+        # DNS lookup (up to 3s) on a fresh network where DNS may not be ready.
+        if self._vpn_server_ip:
+            vpn_ip = self._vpn_server_ip
+        else:
             try:
-                vpn_ip = socket.gethostbyname(hostname)
-            finally:
-                socket.setdefaulttimeout(old_timeout)
-        except Exception as e:
-            logger.debug("Cannot resolve %s for route cleanup: %s", hostname, e)
-            return
+                hostname = urlparse(self.gateway).hostname or self.gateway
+            except Exception:
+                hostname = self.gateway
+
+            try:
+                old_timeout = socket.getdefaulttimeout()
+                socket.setdefaulttimeout(3)
+                try:
+                    vpn_ip = socket.gethostbyname(hostname)
+                finally:
+                    socket.setdefaulttimeout(old_timeout)
+            except Exception as e:
+                logger.debug("Cannot resolve %s for route cleanup: %s", hostname, e)
+                return
 
         try:
             result = subprocess.run(
@@ -407,6 +551,11 @@ class PulseSSOPlugin(dbus.service.Object):
                 keepalive_interval if keepalive_interval else "system default",
             )
 
+        vpn_mtu = get_vpn_mtu()
+        if vpn_mtu is not None:
+            cmd.append(f"--mtu={vpn_mtu}")
+            logger.info("VPN MTU override: %d", vpn_mtu)
+
         cmd.extend(
             [
                 "-C",
@@ -440,6 +589,15 @@ class PulseSSOPlugin(dbus.service.Object):
         )
 
         logger.info("openconnect started with PID %d", self.proc.pid)
+
+        # Write early grace period timestamp so the dispatcher won't kill
+        # a just-spawned openconnect.  Updated again in SetIp4Config with
+        # gateway/device info once the tunnel is fully established.
+        try:
+            with open("/run/vpn-last-connect", "w") as f:
+                f.write(f"{int(time.time())}::")
+        except Exception:
+            pass
 
         # Monitor the process for unexpected exits
         # GLib.child_watch_add will call our callback when the process exits
@@ -486,6 +644,24 @@ class PulseSSOPlugin(dbus.service.Object):
         if exit_code == 2:
             logger.warning("Auth failure (exit code 2) — cookie invalid, clearing")
             self.cookie = None
+            if self.gateway and not self._disconnect_requested:
+                self._auth_failure_count += 1
+                if self._auth_failure_count <= 2:
+                    # Session expired — trigger fresh authentication.
+                    # Allow up to 2 attempts: some servers need two roundtrips
+                    # after a long idle (e.g. resume after 24h session expiry).
+                    logger.info(
+                        "Setting reconnection pending for re-authentication "
+                        "(auth failure %d/2)",
+                        self._auth_failure_count,
+                    )
+                    self._reconnection_pending = True
+                else:
+                    logger.warning(
+                        "Auth failure %d times consecutively — staying stopped "
+                        "to avoid re-auth loop",
+                        self._auth_failure_count,
+                    )
             self.StateChanged(ServiceState.Stopped)
             return
 
@@ -573,8 +749,14 @@ class PulseSSOPlugin(dbus.service.Object):
                 conn_type = s.get("connection", {}).get("type", "")
                 vpn_service = s.get("vpn", {}).get("service-type", "")
                 if conn_type == "vpn" and vpn_service == NM_DBUS_SERVICE:
-                    vpn_conn_path = conn_path
-                    break
+                    conn_uuid = str(s.get("connection", {}).get("uuid", ""))
+                    # Prefer the connection that was originally activated
+                    if self._active_conn_uuid and conn_uuid == self._active_conn_uuid:
+                        vpn_conn_path = conn_path
+                        break
+                    # Remember first match as fallback
+                    if vpn_conn_path is None:
+                        vpn_conn_path = conn_path
 
             if not vpn_conn_path:
                 logger.error("No VPN connection found for service %s", NM_DBUS_SERVICE)
@@ -593,7 +775,36 @@ class PulseSSOPlugin(dbus.service.Object):
             )
             logger.info("VPN re-activation requested successfully")
         except Exception as e:
-            logger.error("Failed to re-activate VPN via NetworkManager: %s", e)
+            # "ConnectionAlreadyActive" means NM activated the connection on its
+            # own path (e.g. a concurrent ConnectInteractive call). This is not
+            # a failure — NM is already handling reconnection. Clear the retry
+            # timer (_reactivation_timeout_id is already None at this point, set
+            # at function entry) and return so the next Disconnect() is not
+            # misread as a user disconnect.
+            if "ConnectionAlreadyActive" in str(e):
+                logger.info(
+                    "Re-activation skipped: connection already active "
+                    "(NM is handling reconnection)"
+                )
+                return False
+            if (not self._disconnect_requested
+                    and self._reactivation_retry_count < self._max_reactivation_retries):
+                self._reactivation_retry_count += 1
+                logger.info(
+                    "Re-activation failed (%s), retrying in 2s (attempt %d/%d)",
+                    e,
+                    self._reactivation_retry_count,
+                    self._max_reactivation_retries,
+                )
+                self._reactivation_timeout_id = GLib.timeout_add(
+                    2000, self._reactivate_vpn_via_nm
+                )
+            else:
+                logger.error(
+                    "Failed to re-activate VPN after %d attempt(s): %s",
+                    self._reactivation_retry_count + 1,
+                    e,
+                )
 
         return False  # Don't repeat
 
@@ -604,6 +815,23 @@ class PulseSSOPlugin(dbus.service.Object):
         This consolidates retry logic to ensure proper state emission when
         all retries are exhausted.
         """
+        self._total_auth_launch_failures += 1
+
+        # Global cap: stop after 20 total failures across all re-activation
+        # cycles to prevent the infinite NM timeout → re-activate → fail loop.
+        if self._total_auth_launch_failures >= 20:
+            logger.error(
+                "Total auth failures (%d) exceeded global cap: %s",
+                self._total_auth_launch_failures,
+                reason,
+            )
+            self._reconnection_pending = False
+            self.StateChanged(ServiceState.Stopped)
+            self.Failure(
+                f"VPN auth failed {self._total_auth_launch_failures} times total: {reason}"
+            )
+            return
+
         if self._reconnection_retry_count >= self._max_reconnection_retries:
             logger.error(
                 "Max auth retries (%d) exceeded: %s",
@@ -616,14 +844,24 @@ class PulseSSOPlugin(dbus.service.Object):
                 f"VPN reconnection failed after {self._max_reconnection_retries} attempts: {reason}"
             )
         else:
+            # Progressive backoff: 3s for first 3, 10s for next 3, 30s after
+            total = self._total_auth_launch_failures
+            if total <= 3:
+                delay = 3000
+            elif total <= 6:
+                delay = 10000
+            else:
+                delay = 30000
+
             logger.info(
-                "Scheduling auth retry in %dms (attempt %d/%d): %s",
-                self._reconnection_retry_interval,
+                "Scheduling auth retry in %dms (attempt %d/%d, total %d): %s",
+                delay,
                 self._reconnection_retry_count,
                 self._max_reconnection_retries,
+                total,
                 reason,
             )
-            self._schedule_direct_auth(self._reconnection_retry_interval)
+            self._schedule_direct_auth(delay)
 
     def _schedule_direct_auth(self, delay_ms: int):
         """
@@ -651,12 +889,19 @@ class PulseSSOPlugin(dbus.service.Object):
         Since auth-dialog is launched via systemd-run --pipe --wait, killing the
         systemd-run process causes systemd to stop the transient unit and its
         cgroup, which terminates the auth-dialog and CEF browser.
+
+        Uses SIGTERM first to let systemd-run stop the transient unit properly
+        (and its cgroup, cleaning up CEF), then SIGKILL as fallback.
         """
         proc = self._auth_dialog_proc
         if proc is not None:
             logger.info("Killing auth-dialog subprocess PID %d", proc.pid)
             try:
-                proc.kill()
+                proc.terminate()  # SIGTERM — lets systemd-run stop transient unit
+                try:
+                    proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    proc.kill()  # SIGKILL as fallback
             except OSError:
                 pass  # Process may have already exited
             self._auth_dialog_proc = None
@@ -683,6 +928,38 @@ class PulseSSOPlugin(dbus.service.Object):
 
         # Clean up stale routes so auth browser can reach VPN server
         self._cleanup_stale_vpn_routes()
+
+        # Kill any stale auth-dialog before starting a new attempt
+        self._kill_auth_dialog()
+
+        # Suppress auth-dialog during system suspend.
+        # The post-resume.target can overlap with a new suspend (e.g. brief s2idle
+        # wake followed immediately by lid-close). Any dialog launched during this
+        # window will show a blank page because the network/D-Bus session is going
+        # down. Return without scheduling a retry — the normal wake recovery
+        # (vpn-auto-reconnect dispatcher or NM ConnectInteractive) will handle
+        # reconnection after the system is fully awake.
+        if self._suspending:
+            logger.info(
+                "System is suspending, skipping auth-dialog launch "
+                "(wake recovery will reconnect)"
+            )
+            return False
+
+        # Wait for system stabilization after resume.
+        # D-Bus user session, DNS, and display server need time to come up.
+        # Without this delay, auth-dialog launches fail repeatedly and may
+        # open partial CEF windows that show error pages.
+        if self._resume_timestamp:
+            elapsed = time.time() - self._resume_timestamp
+            if elapsed < 8:
+                wait_ms = int((8 - elapsed) * 1000)
+                logger.info(
+                    "%.1fs since resume, waiting %dms for system stabilization",
+                    elapsed, wait_ms,
+                )
+                self._schedule_direct_auth(wait_ms)
+                return False
 
         # Wait for DNS to be ready before launching browser.
         # After suspend/resume or network change, DNS may not be functional yet.
@@ -712,6 +989,20 @@ class PulseSSOPlugin(dbus.service.Object):
                 else:
                     self._schedule_auth_retry(f"DNS not ready for {hostname}")
                 return False
+
+        # Verify default route exists before launching auth.
+        # Without a default route, the browser can't reach the VPN server.
+        try:
+            rt_result = subprocess.run(
+                ["ip", "route", "show", "default"],
+                capture_output=True, text=True, timeout=2,
+            )
+            if not rt_result.stdout.strip():
+                logger.info("No default route, deferring auth launch (retrying in 3s)")
+                self._schedule_direct_auth(3000)
+                return False
+        except Exception:
+            pass  # Proceed if route check fails
 
         if not self._reconnection_pending:
             logger.debug("Reconnection no longer pending, skipping direct auth")
@@ -804,6 +1095,37 @@ class PulseSSOPlugin(dbus.service.Object):
             # Default environment values for graphical auth
             runtime_dir = f"/run/user/{uid}"
             dbus_addr = f"unix:path={runtime_dir}/bus"
+
+            # Quick health check: can we reach the user's D-Bus session bus?
+            # After NM restart, systemd-run --machine=user@ fails with
+            # "Transport endpoint is not connected" for minutes. Detect this
+            # early and defer instead of burning through all launch strategies.
+            # NOTE: A socket connect only checks the socket exists — it can
+            # pass even when the bus daemon is broken. But it catches the case
+            # where the socket is completely gone (post-reboot, user logged out).
+            bus_path = f"{runtime_dir}/bus"
+            try:
+                test_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                test_sock.settimeout(1)
+                test_sock.connect(bus_path)
+                test_sock.close()
+            except (OSError, socket.timeout):
+                self._system_not_ready_count += 1
+                if self._system_not_ready_count >= 40:
+                    logger.error(
+                        "System not ready after %d attempts (bus), giving up",
+                        self._system_not_ready_count,
+                    )
+                    self._reconnection_pending = False
+                    self.StateChanged(ServiceState.Stopped)
+                    self.Failure("VPN auth failed: D-Bus session not available")
+                    return False
+                logger.warning(
+                    "User bus not reachable at %s, deferring auth launch (retrying in 3s)",
+                    bus_path,
+                )
+                self._schedule_direct_auth(3000)
+                return False
             wayland_display = None
             xauthority = None
 
@@ -916,6 +1238,9 @@ class PulseSSOPlugin(dbus.service.Object):
             # Auth-dialog protocol: send gateway via stdin
             self._auth_input_data = f"DATA_KEY=gateway\nDATA_VAL={self.gateway}\nDONE\n".encode()
 
+            # Reset transient-failure tracking for this auth attempt
+            self._all_strategies_transient = True
+
             # Start the first launch attempt (non-blocking)
             self._try_next_auth_launch()
 
@@ -931,9 +1256,35 @@ class PulseSSOPlugin(dbus.service.Object):
             logger.debug("Reconnection cancelled, aborting auth launch")
             return
 
+        # Skip strategies that previously failed with "Transport endpoint"
+        while (self._auth_launch_index in self._broken_strategies and
+               self._auth_launch_index < len(self._auth_launch_commands)):
+            logger.debug("Skipping broken strategy %d", self._auth_launch_index + 1)
+            self._auth_launch_index += 1
+
         if self._auth_launch_index >= len(self._auth_launch_commands):
-            logger.error("Auth-dialog failed after all launch strategies")
-            self._schedule_auth_retry("All launch strategies failed")
+            if self._all_strategies_transient:
+                # All failures were transient (Transport endpoint, CEF init, etc.)
+                # Don't count toward auth failure cap — system just needs time
+                self._system_not_ready_count += 1
+                if self._system_not_ready_count >= 40:
+                    logger.error(
+                        "System not ready after %d attempts (strategies), giving up",
+                        self._system_not_ready_count,
+                    )
+                    self._reconnection_pending = False
+                    self.StateChanged(ServiceState.Stopped)
+                    self.Failure("VPN auth failed: system not ready (D-Bus/CEF)")
+                    return
+                logger.info(
+                    "All strategies failed with transient errors, retrying in 5s "
+                    "(system not ready %d/40)",
+                    self._system_not_ready_count,
+                )
+                self._schedule_direct_auth(5000)
+            else:
+                logger.error("Auth-dialog failed after all launch strategies")
+                self._schedule_auth_retry("All launch strategies failed")
             return
 
         launch_cmd = self._auth_launch_commands[self._auth_launch_index]
@@ -1041,18 +1392,38 @@ class PulseSSOPlugin(dbus.service.Object):
             return
 
         if exit_code != 0:
+            stderr_text = stderr.decode(errors="replace")
             logger.error(
                 "Auth-dialog (attempt %d) failed (exit %d): %s",
                 self._auth_launch_index + 1,
                 exit_code,
-                stderr.decode(errors="replace"),
+                stderr_text,
             )
+
+            # Track transient vs real auth failures.
+            # "Transport endpoint" and "CEF initialization failed" are system
+            # readiness issues that resolve with time — don't count them toward
+            # the global auth failure cap.
+            is_transient = (
+                "Transport endpoint" in stderr_text
+                or "CEF initialization failed" in stderr_text
+                or "CEF authentication failed" in stderr_text
+                or "Cannot connect to" in stderr_text  # TCP check from auth-dialog
+            )
+
+            if "Transport endpoint" in stderr_text:
+                self._broken_strategies.add(self._auth_launch_index)
+
+            if not is_transient:
+                self._all_strategies_transient = False
+
             # Try next launch strategy
             self._auth_launch_index += 1
             if self._auth_launch_index < len(self._auth_launch_commands):
                 self._try_next_auth_launch()
             else:
-                self._schedule_auth_retry("All launch strategies failed")
+                # Handled by _try_next_auth_launch when index >= len
+                self._try_next_auth_launch()
             return
 
         # Parse cookie from stdout (protocol: key\nvalue\nkey\nvalue...)
@@ -1091,7 +1462,10 @@ class PulseSSOPlugin(dbus.service.Object):
             # Only clear reconnection state AFTER openconnect starts successfully
             self._reconnection_pending = False
             self._reconnection_retry_count = 0
-            self._auth_failure_count = 0
+            # Note: _auth_failure_count is intentionally NOT reset here.
+            # It tracks exit-code-2 failures since the last working VPN tunnel
+            # (SetIp4Config). Resetting here would allow infinite re-auth loops
+            # if the server rejects every fresh cookie.
             self._cancel_direct_auth_timer()
         except Exception as e:
             logger.exception("Failed to start openconnect after auth: %s", e)
@@ -1110,6 +1484,11 @@ class PulseSSOPlugin(dbus.service.Object):
         """
         connection = convert_dbus_types(connection)
         logger.info("Connect called with connection: %s", connection)
+
+        # Remember which connection was activated for re-activation
+        conn_uuid = connection.get("connection", {}).get("uuid", "")
+        if conn_uuid:
+            self._active_conn_uuid = conn_uuid
 
         # Cancel idle quit timer — we got a Connect call
         if self._idle_quit_timeout_id is not None:
@@ -1171,6 +1550,11 @@ class PulseSSOPlugin(dbus.service.Object):
         connection = convert_dbus_types(connection)
         logger.info("ConnectInteractive called with connection: %s", connection)
 
+        # Remember which connection was activated for re-activation
+        conn_uuid = connection.get("connection", {}).get("uuid", "")
+        if conn_uuid:
+            self._active_conn_uuid = conn_uuid
+
         # Cancel idle quit timer — we got a Connect call
         if self._idle_quit_timeout_id is not None:
             GLib.source_remove(self._idle_quit_timeout_id)
@@ -1210,6 +1594,18 @@ class PulseSSOPlugin(dbus.service.Object):
                 gateway = f"https://{gateway}"
 
             self.gateway = gateway
+
+            # Check if auth is already running — don't launch duplicate
+            if self._auth_dialog_proc is not None or self._direct_auth_timeout_id is not None:
+                logger.info(
+                    "Auth dialog already running, not launching duplicate "
+                    "(will use result from current auth)"
+                )
+                self._reconnection_pending = True
+                self._reconnection_retry_count = 0
+                self.StateChanged(ServiceState.Starting)
+                return
+
             self._reconnection_pending = True
             self._reconnection_retry_count = 0
             self.StateChanged(ServiceState.Starting)
@@ -1289,6 +1685,24 @@ class PulseSSOPlugin(dbus.service.Object):
                 self.loop.quit()
                 return
 
+            # If auth dialog is running or scheduled, preserve it.
+            # NM's Disconnect/re-activate cycle would otherwise kill the dialog
+            # and launch a new one, causing duplicate auth popups.
+            if self._auth_dialog_proc is not None or self._direct_auth_timeout_id is not None:
+                logger.info(
+                    "Disconnect during active auth — preserving auth flow, "
+                    "scheduling re-activation for NM"
+                )
+                self.StateChanged(ServiceState.Stopped)
+                if self._reactivation_timeout_id is not None:
+                    GLib.source_remove(self._reactivation_timeout_id)
+                self._reactivation_retry_count = 0
+                self._is_reactivation = True
+                self._reactivation_timeout_id = GLib.timeout_add(
+                    500, self._reactivate_vpn_via_nm
+                )
+                return
+
             logger.info("Disconnect called but openconnect already exited — "
                         "cooperating with NM teardown, will re-activate")
 
@@ -1309,9 +1723,11 @@ class PulseSSOPlugin(dbus.service.Object):
 
             # Schedule VPN re-activation through NM (after teardown completes)
             if should_reactivate:
-                logger.info("Scheduling VPN re-activation through NetworkManager in 1s")
+                logger.info("Scheduling VPN re-activation through NetworkManager")
+                self._reactivation_retry_count = 0
+                self._is_reactivation = True
                 self._reactivation_timeout_id = GLib.timeout_add(
-                    1000, self._reactivate_vpn_via_nm
+                    500, self._reactivate_vpn_via_nm
                 )
             else:
                 logger.info("No credentials for re-activation, staying stopped")
@@ -1428,6 +1844,19 @@ class PulseSSOPlugin(dbus.service.Object):
         """Called by helper script with general VPN config."""
         logger.info("SetConfig called: %s", config)
         self.config = convert_dbus_types(config)
+
+        # Cache VPN server IP for _cleanup_stale_vpn_routes() to avoid
+        # blocking DNS lookups on reconnect.
+        gw_uint = config.get("gateway")
+        if gw_uint is not None:
+            try:
+                # NM passes IPs as uint32 in host byte order (little-endian on x86)
+                self._vpn_server_ip = socket.inet_ntoa(
+                    struct.pack("<I", int(gw_uint))
+                )
+            except Exception:
+                pass
+
         self.Config(config)
         logger.info("Config signal emitted")
 
@@ -1447,6 +1876,13 @@ class PulseSSOPlugin(dbus.service.Object):
             )
             self._auth_failure_count = 0
 
+        if self._total_auth_launch_failures > 0:
+            logger.info(
+                "Resetting total auth launch failure count (was %d)",
+                self._total_auth_launch_failures,
+            )
+            self._total_auth_launch_failures = 0
+
         if self._reconnection_retry_count > 0:
             logger.info(
                 "Resetting reconnection retry count (was %d)",
@@ -1462,6 +1898,10 @@ class PulseSSOPlugin(dbus.service.Object):
             )
             self._consecutive_restart_failures = 0
 
+        # Reset system-readiness and broken-strategy tracking
+        self._system_not_ready_count = 0
+        self._broken_strategies.clear()
+
         self._cancel_direct_auth_timer()
 
         # Store converted types for internal use
@@ -1473,6 +1913,38 @@ class PulseSSOPlugin(dbus.service.Object):
         self.StateChanged(ServiceState.Started)
 
         logger.info("VPN connection established")
+
+        # Write connect info for dispatcher grace period and cooldown bypass.
+        # Format: timestamp:gateway:device
+        # The dispatcher uses the timestamp to avoid killing a just-connected
+        # VPN, and the gateway/device to detect stale routes (e.g., VPN was
+        # routed through Ethernet but Ethernet went down and WiFi came up).
+        try:
+            gw_ip = ""
+            gw_dev = ""
+            rt = subprocess.run(
+                ["ip", "route", "show", "default"],
+                capture_output=True, text=True, timeout=2,
+            )
+            for line in rt.stdout.splitlines():
+                parts = line.split()
+                # Skip default routes through tun/tap (the VPN tunnel itself)
+                if len(parts) >= 5 and not parts[4].startswith(("tun", "tap")):
+                    gw_ip = parts[2]
+                    gw_dev = parts[4]
+                    break
+            with open("/run/vpn-last-connect", "w") as f:
+                f.write(f"{int(time.time())}:{gw_ip}:{gw_dev}")
+        except Exception:
+            pass
+
+        # Notify user on re-activation (not on first connect)
+        if self._is_reactivation:
+            self._is_reactivation = False
+            self._send_user_notification(
+                "VPN Reconnected",
+                "VPN auto-reconnected successfully",
+            )
 
     @method(dbus_interface=NM_DBUS_INTERFACE, in_signature="a{sv}")
     @trace

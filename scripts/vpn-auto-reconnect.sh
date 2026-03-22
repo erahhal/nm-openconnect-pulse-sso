@@ -17,9 +17,13 @@ if [ ! -f "$FLAG" ]; then
     exit 0
 fi
 
-# Check if VPN is already connected
+# Check if VPN is already connected or activating (auth-dialog may already be open)
 if @networkmanager@/bin/nmcli -t -f TYPE,STATE connection show --active 2>/dev/null | grep -q "^vpn:activated$"; then
     echo "VPN already connected"
+    exit 0
+fi
+if @networkmanager@/bin/nmcli -t -f TYPE,STATE connection show --active 2>/dev/null | grep -q "^vpn:activating$"; then
+    echo "VPN already activating (auth dialog running), skipping duplicate attempt"
     exit 0
 fi
 
@@ -28,24 +32,34 @@ exec 200>"$LOCK"
 @util-linux@/bin/flock -n 200 || { echo "Another reconnect attempt in progress"; exit 0; }
 
 # Kill any lingering openconnect processes (e.g., stale after resume)
-@procps@/bin/pkill -x openconnect 2>/dev/null || true
-sleep 2
+# Only wait if openconnect is actually running — avoids 2s delay in the common
+# interface-change case where the service already killed it.
 if @procps@/bin/pgrep -x openconnect >/dev/null 2>&1; then
-    @procps@/bin/pkill -9 -x openconnect 2>/dev/null || true
-    sleep 1
+    @procps@/bin/pkill -x openconnect 2>/dev/null || true
+    sleep 2
+    if @procps@/bin/pgrep -x openconnect >/dev/null 2>&1; then
+        @procps@/bin/pkill -9 -x openconnect 2>/dev/null || true
+        sleep 1
+    fi
 fi
 
 # Wait for network connectivity (up to 20s)
+# Track whether NM was already connected on first check (no wait needed).
+nm_was_ready="no"
 for i in $(@coreutils@/bin/seq 1 10); do
     if @networkmanager@/bin/nmcli -t -f STATE general status 2>/dev/null | grep -q "connected"; then
+        if [ "$i" -eq 1 ]; then nm_was_ready="yes"; fi
         break
     fi
     echo "Waiting for network connectivity... ($i/10)"
     sleep 2
 done
 
-# Brief pause to let NM fully register the new connection
-sleep 3
+# Only pause to let NM settle if we had to wait for connectivity.
+# When NM was already connected (common interface-change case), this is pure waste.
+if [ "$nm_was_ready" != "yes" ]; then
+    sleep 3
+fi
 
 # Flush DNS caches (stale after resume)
 @systemd@/bin/resolvectl flush-caches 2>/dev/null || true

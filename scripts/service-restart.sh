@@ -9,6 +9,42 @@
 
 VPN_NAME="@vpnName@"
 
+# Clean up stale VPN connections that don't match the current ensureProfiles config.
+# When the gateway changes, ensureProfiles creates a new connection in /run/ but
+# old internalized copies persist in /etc/NetworkManager/system-connections/.
+# NM loads both, causing duplicate VPN entries with different gateways.
+echo "Cleaning up stale VPN connections..."
+
+# Wait for NM to be ready (connections loaded) — may not be fully up yet at boot
+for _i in 1 2 3 4 5; do
+    if @networkmanager@/bin/nmcli -t -f NAME connection show 2>/dev/null | grep -qF "$VPN_NAME"; then
+        break
+    fi
+    echo "  Waiting for NetworkManager to load connections..."
+    sleep 1
+done
+
+# Get all connections with their filenames in one shot.
+# nmcli -t uses : as separator. FILENAME field works in list-all mode
+# but NOT in per-connection queries (exit code 2).
+# Output example:
+#   Netflix VPN:3da9c86d-...:/var/run/NetworkManager/system-connections/pulse-sso-vpn.nmconnection
+#   Netflix VPN:081842c9-...:/etc/NetworkManager/system-connections/Netflix VPN.nmconnection
+@networkmanager@/bin/nmcli -t -f NAME,UUID,FILENAME connection show 2>/dev/null \
+    | while IFS=: read -r CONN_NAME CONN_UUID CONN_FILE; do
+    if [ "$CONN_NAME" = "$VPN_NAME" ]; then
+        case "$CONN_FILE" in
+            /run/*|/var/run/*)
+                echo "  Keeping ensureProfiles connection: $CONN_UUID ($CONN_FILE)"
+                ;;
+            *)
+                echo "  Removing stale connection: $CONN_UUID ($CONN_FILE)"
+                @networkmanager@/bin/nmcli connection delete "$CONN_UUID" 2>/dev/null || true
+                ;;
+        esac
+    fi
+done
+
 # Check if VPN was connected by looking for openconnect process
 VPN_WAS_ACTIVE=""
 if @procps@/bin/pgrep -x openconnect >/dev/null 2>&1; then
@@ -63,25 +99,41 @@ if [ -n "$VPN_WAS_ACTIVE" ]; then
     sleep 3
     RECONNECTED=""
     for attempt in 1 2 3 4 5; do
-        echo "VPN reconnect attempt $attempt..."
-        if @networkmanager@/bin/nmcli connection up "$VPN_NAME" 2>&1; then
-            echo "VPN reconnected successfully"
+        # Check if VPN connected (e.g. from a previous attempt's auth completing)
+        if @procps@/bin/pgrep -x openconnect >/dev/null 2>&1; then
+            echo "VPN is connected (openconnect running)"
             RECONNECTED="1"
-            for uid in $(@systemd@/bin/loginctl list-users --no-legend | @gawk@/bin/awk '{print $1}'); do
-                RUNTIME_DIR="/run/user/$uid"
-                if [ -S "$RUNTIME_DIR/bus" ]; then
-                    @sudo@/bin/sudo -u "#$uid" DBUS_SESSION_BUS_ADDRESS="unix:path=$RUNTIME_DIR/bus" \
-                        @libnotify@/bin/notify-send -i network-vpn "VPN Reconnected" \
-                        "VPN reconnected after NixOS rebuild" 2>/dev/null || true
-                fi
-            done
             break
         fi
-        echo "Attempt $attempt failed, retrying in 5s..."
+
+        echo "VPN reconnect attempt $attempt..."
+        OUTPUT=$(@networkmanager@/bin/nmcli connection up "$VPN_NAME" 2>&1) && {
+            echo "VPN reconnected successfully"
+            RECONNECTED="1"
+            break
+        }
+
+        # "already active" means VPN is connecting or connected — treat as success
+        if echo "$OUTPUT" | grep -q "already active"; then
+            echo "VPN is already activating/active"
+            RECONNECTED="1"
+            break
+        fi
+
+        echo "Attempt $attempt failed ($OUTPUT), retrying in 5s..."
         sleep 5
     done
 
-    if [ -z "$RECONNECTED" ]; then
+    if [ -n "$RECONNECTED" ]; then
+        for uid in $(@systemd@/bin/loginctl list-users --no-legend | @gawk@/bin/awk '{print $1}'); do
+            RUNTIME_DIR="/run/user/$uid"
+            if [ -S "$RUNTIME_DIR/bus" ]; then
+                @sudo@/bin/sudo -u "#$uid" DBUS_SESSION_BUS_ADDRESS="unix:path=$RUNTIME_DIR/bus" \
+                    @libnotify@/bin/notify-send -i network-vpn "VPN Reconnected" \
+                    "VPN reconnected after NixOS rebuild" 2>/dev/null || true
+            fi
+        done
+    else
         echo "VPN reconnect failed after 5 attempts"
         for uid in $(@systemd@/bin/loginctl list-users --no-legend | @gawk@/bin/awk '{print $1}'); do
             RUNTIME_DIR="/run/user/$uid"

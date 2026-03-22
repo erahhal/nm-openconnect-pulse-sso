@@ -20,6 +20,7 @@ import socket
 import ssl
 import subprocess
 import sys
+import time
 
 
 def get_server_cert_fingerprint(hostname: str, port: int = 443) -> str:
@@ -190,6 +191,35 @@ def main():
         sys.stdout.flush()
         wait_for_quit()
         return 0
+
+    # Wait for DNS to be ready before opening the browser.
+    # On resume from suspend, DNS may not be available yet even though NM
+    # reports "connected". Opening the browser before DNS is ready causes
+    # ERR_NAME_NOT_RESOLVED, a 300s timeout, and spurious retry attempts
+    # that open additional browser windows.
+    dns_ready = False
+    for _attempt in range(15):
+        try:
+            socket.getaddrinfo(hostname, 443, type=socket.SOCK_STREAM)
+            dns_ready = True
+            break
+        except socket.gaierror:
+            print(f"Waiting for DNS ({hostname})... ({_attempt + 1}/15)", file=sys.stderr)
+            time.sleep(2)
+
+    if not dns_ready:
+        print(f"DNS not ready for {hostname} after 30s, aborting", file=sys.stderr)
+        sys.exit(1)
+
+    # Verify TCP connectivity to VPN server before launching CEF.
+    # DNS may resolve (cached) while the network path is broken after resume.
+    # Opening CEF without connectivity shows an error page that persists.
+    try:
+        sock = socket.create_connection((hostname, 443), timeout=5)
+        sock.close()
+    except (OSError, socket.timeout) as e:
+        print(f"Cannot connect to {hostname}:443 ({e}), aborting", file=sys.stderr)
+        sys.exit(1)
 
     # Need to authenticate - run CEF browser
     try:

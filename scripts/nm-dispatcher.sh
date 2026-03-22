@@ -34,7 +34,7 @@ if [ -z "$IFACE" ] && [ "$ACTION" = "connectivity-change" ]; then
 fi
 
 case "$IFACE" in
-    tun*|tap*|lo|docker*|br-*|veth*)
+    tun*|tap*|lo|docker*|br-*|veth*|tailscale*)
         exit 0
         ;;
 esac
@@ -92,8 +92,34 @@ else
 fi
 
 if [ -z "$TARGET_GW" ] || [ -z "$TARGET_DEV" ]; then
-    log_msg "No suitable gateway/interface found"
+    # If openconnect is running and an interface went down with no other
+    # gateway available, the VPN route is broken.  Kill openconnect now;
+    # when a new interface comes UP the "openconnect not running" path
+    # (line 56-61) will trigger vpn-auto-reconnect.
+    if [ -n "$OPENCONNECT_PID" ] && [ "$ACTION" = "down" ]; then
+        log_msg "No gateway available after $IFACE went down — killing openconnect (PID: $OPENCONNECT_PID)"
+        kill -TERM "$OPENCONNECT_PID" 2>/dev/null || true
+        # Don't write cooldown file — next UP event should reconnect freely
+    else
+        log_msg "No suitable gateway/interface found"
+    fi
     exit 0
+fi
+
+# Grace period: don't kill openconnect if VPN just connected (< 10s ago).
+# After extended auth failures, killing a just-connected VPN forces another
+# auth cycle — wasting the connection that finally succeeded.
+# Grace file format: timestamp:gateway:device  (gateway/device may be empty)
+GRACE_FILE="/run/vpn-last-connect"
+if [ -f "$GRACE_FILE" ]; then
+    GRACE_DATA=$(cat "$GRACE_FILE" 2>/dev/null || echo "0::")
+    LAST_CONNECT=$(echo "$GRACE_DATA" | cut -d: -f1)
+    NOW=$(@coreutils@/bin/date +%s)
+    CONNECT_AGO=$((NOW - LAST_CONNECT))
+    if [ "$CONNECT_AGO" -lt 10 ]; then
+        log_msg "VPN connected ${CONNECT_AGO}s ago, skipping kill (grace period)"
+        exit 0
+    fi
 fi
 
 # Cooldown: don't kill openconnect if we killed it recently on the same network.
@@ -112,8 +138,23 @@ if [ -f "$COOLDOWN_FILE" ]; then
     ELAPSED=$((NOW - LAST_KILL))
     if [ "$ELAPSED" -lt "$COOLDOWN_SECONDS" ]; then
         if [ "$LAST_GW" = "$TARGET_GW" ] && [ "$LAST_DEV" = "$TARGET_DEV" ]; then
-            log_msg "Skipping kill: last restart was ${ELAPSED}s ago (cooldown: ${COOLDOWN_SECONDS}s), same network ($TARGET_DEV/$TARGET_GW)"
+            log_msg "Cooldown active: last kill was ${ELAPSED}s ago (cooldown: ${COOLDOWN_SECONDS}s), same network ($TARGET_DEV/$TARGET_GW)"
             SKIP_KILL=true
+
+            # But if the VPN is routed through a DIFFERENT gateway than the
+            # current target, the tunnel is stale (e.g., VPN was on Ethernet
+            # which went down, now WiFi is up).  Bypass cooldown.
+            if [ -f "$GRACE_FILE" ]; then
+                VPN_INFO=$(cat "$GRACE_FILE" 2>/dev/null || echo "0::")
+                VPN_GW=$(echo "$VPN_INFO" | cut -d: -f2)
+                VPN_DEV=$(echo "$VPN_INFO" | cut -d: -f3)
+                if [ -n "$VPN_GW" ] && [ -n "$VPN_DEV" ]; then
+                    if [ "$VPN_GW" != "$TARGET_GW" ] || [ "$VPN_DEV" != "$TARGET_DEV" ]; then
+                        log_msg "VPN on $VPN_DEV/$VPN_GW but target is $TARGET_DEV/$TARGET_GW — bypassing cooldown (stale route)"
+                        SKIP_KILL=false
+                    fi
+                fi
+            fi
         else
             log_msg "Network changed ($LAST_DEV/$LAST_GW -> $TARGET_DEV/$TARGET_GW), bypassing cooldown"
         fi
@@ -121,7 +162,16 @@ if [ -f "$COOLDOWN_FILE" ]; then
 fi
 
 if [ "$SKIP_KILL" = "false" ]; then
-    sleep 1
+    # Notify user that VPN is reconnecting
+    for uid in $(@systemd@/bin/loginctl list-users --no-legend | @gawk@/bin/awk '{print $1}'); do
+        RUNTIME_DIR="/run/user/$uid"
+        if [ -S "$RUNTIME_DIR/bus" ]; then
+            @sudo@/bin/sudo -u "#$uid" DBUS_SESSION_BUS_ADDRESS="unix:path=$RUNTIME_DIR/bus" \
+                @libnotify@/bin/notify-send -i network-vpn "VPN Reconnecting" \
+                "Network changed — reconnecting VPN..." 2>/dev/null || true
+        fi
+    done
+
     log_msg "Sending SIGTERM to openconnect (PID: $OPENCONNECT_PID)"
     kill -TERM "$OPENCONNECT_PID"
     for i in 1 2 3 4 5; do
