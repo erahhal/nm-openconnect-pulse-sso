@@ -224,6 +224,46 @@ class PulseSSOPlugin(dbus.service.Object):
         # after a reactive disconnect (keeps cookie alive for external reconnect)
         self._idle_quit_timeout_id: Optional[int] = None
 
+        # Suppress auth-dialog launch during system suspend.
+        # Set by PrepareForSleep(true) from systemd-logind, cleared on resume.
+        self._suspending: bool = False
+
+        # Subscribe to systemd-logind PrepareForSleep signal to prevent
+        # spurious mid-sleep auth-dialog popups (e.g. when post-resume.target
+        # and a new suspend overlap during a brief s2idle wake cycle).
+        try:
+            login1_proxy = conn.get_object(
+                "org.freedesktop.login1", "/org/freedesktop/login1"
+            )
+            login1_iface = dbus.Interface(
+                login1_proxy, "org.freedesktop.login1.Manager"
+            )
+            login1_iface.connect_to_signal(
+                "PrepareForSleep", self._on_prepare_for_sleep
+            )
+            logger.debug("Subscribed to PrepareForSleep signal from systemd-logind")
+        except Exception as e:
+            logger.warning("Failed to subscribe to PrepareForSleep signal: %s", e)
+
+    def _on_prepare_for_sleep(self, active: bool):
+        """
+        Handle systemd-logind PrepareForSleep signal.
+
+        Called before suspend (active=True) and after resume (active=False).
+        Suppresses auth-dialog launch during the suspend window to prevent
+        spurious popups when a brief s2idle wake is immediately followed
+        by a new suspend.
+        """
+        self._suspending = bool(active)
+        if active:
+            logger.info(
+                "PrepareForSleep: system suspending — suppressing auth-dialog launch"
+            )
+        else:
+            logger.info(
+                "PrepareForSleep: system resuming — auth-dialog launch re-enabled"
+            )
+
     def _do_connect(self, connection: dict):
         """
         Actually establish the VPN connection with provided credentials.
@@ -487,12 +527,23 @@ class PulseSSOPlugin(dbus.service.Object):
             logger.warning("Auth failure (exit code 2) — cookie invalid, clearing")
             self.cookie = None
             if self.gateway and not self._disconnect_requested:
-                # Session expired (e.g. 24h server timeout). Set reconnection
-                # pending so NM's reactive Disconnect() schedules re-activation.
-                # NM will call ConnectInteractive() with no cookie, triggering
-                # the direct-auth (browser) path for fresh authentication.
-                logger.info("Setting reconnection pending for re-authentication")
-                self._reconnection_pending = True
+                self._auth_failure_count += 1
+                if self._auth_failure_count <= 2:
+                    # Session expired — trigger fresh authentication.
+                    # Allow up to 2 attempts: some servers need two roundtrips
+                    # after a long idle (e.g. resume after 24h session expiry).
+                    logger.info(
+                        "Setting reconnection pending for re-authentication "
+                        "(auth failure %d/2)",
+                        self._auth_failure_count,
+                    )
+                    self._reconnection_pending = True
+                else:
+                    logger.warning(
+                        "Auth failure %d times consecutively — staying stopped "
+                        "to avoid re-auth loop",
+                        self._auth_failure_count,
+                    )
             self.StateChanged(ServiceState.Stopped)
             return
 
@@ -690,6 +741,20 @@ class PulseSSOPlugin(dbus.service.Object):
 
         # Clean up stale routes so auth browser can reach VPN server
         self._cleanup_stale_vpn_routes()
+
+        # Suppress auth-dialog during system suspend.
+        # The post-resume.target can overlap with a new suspend (e.g. brief s2idle
+        # wake followed immediately by lid-close). Any dialog launched during this
+        # window will show a blank page because the network/D-Bus session is going
+        # down. Return without scheduling a retry — the normal wake recovery
+        # (vpn-auto-reconnect dispatcher or NM ConnectInteractive) will handle
+        # reconnection after the system is fully awake.
+        if self._suspending:
+            logger.info(
+                "System is suspending, skipping auth-dialog launch "
+                "(wake recovery will reconnect)"
+            )
+            return False
 
         # Wait for DNS to be ready before launching browser.
         # After suspend/resume or network change, DNS may not be functional yet.
@@ -1098,7 +1163,10 @@ class PulseSSOPlugin(dbus.service.Object):
             # Only clear reconnection state AFTER openconnect starts successfully
             self._reconnection_pending = False
             self._reconnection_retry_count = 0
-            self._auth_failure_count = 0
+            # Note: _auth_failure_count is intentionally NOT reset here.
+            # It tracks exit-code-2 failures since the last working VPN tunnel
+            # (SetIp4Config). Resetting here would allow infinite re-auth loops
+            # if the server rejects every fresh cookie.
             self._cancel_direct_auth_timer()
         except Exception as e:
             logger.exception("Failed to start openconnect after auth: %s", e)
