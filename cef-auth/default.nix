@@ -4,7 +4,18 @@
   cmake,
   cef-binary,
   makeWrapper,
-  xorg,
+  libx11,
+  libxcomposite,
+  libxdamage,
+  libxext,
+  libxfixes,
+  libxrandr,
+  libxcb,
+  libxtst,
+  libxscrnsaver,
+  libxcursor,
+  libxi,
+  libxrender,
   gtk3,
   glib,
   nss,
@@ -46,18 +57,18 @@ stdenv.mkDerivation {
 
   buildInputs = [
     cef-binary
-    xorg.libX11
-    xorg.libXcomposite
-    xorg.libXdamage
-    xorg.libXext
-    xorg.libXfixes
-    xorg.libXrandr
-    xorg.libxcb
-    xorg.libXtst
-    xorg.libXScrnSaver
-    xorg.libXcursor
-    xorg.libXi
-    xorg.libXrender
+    libx11
+    libxcomposite
+    libxdamage
+    libxext
+    libxfixes
+    libxrandr
+    libxcb
+    libxtst
+    libxscrnsaver
+    libxcursor
+    libxi
+    libxrender
     gtk3
     glib
     nss
@@ -99,18 +110,18 @@ stdenv.mkDerivation {
     wrapProgram $out/bin/pulse-browser-auth \
       --prefix LD_LIBRARY_PATH : "$out/lib/cef" \
       --prefix LD_LIBRARY_PATH : "${lib.makeLibraryPath [
-        xorg.libX11
-        xorg.libXcomposite
-        xorg.libXdamage
-        xorg.libXext
-        xorg.libXfixes
-        xorg.libXrandr
-        xorg.libxcb
-        xorg.libXtst
-        xorg.libXScrnSaver
-        xorg.libXcursor
-        xorg.libXi
-        xorg.libXrender
+        libx11
+        libxcomposite
+        libxdamage
+        libxext
+        libxfixes
+        libxrandr
+        libxcb
+        libxtst
+        libxscrnsaver
+        libxcursor
+        libxi
+        libxrender
         gtk3
         glib
         nss
