@@ -268,22 +268,17 @@ public:
             command_line->AppendSwitch("no-sandbox");
             command_line->AppendSwitch("disable-setuid-sandbox");
 
-            // Enable features: WebAuthn + GPU acceleration
+            // Enable features: WebAuthn
             command_line->AppendSwitchWithValue("enable-features",
-                "WebAuthentication,WebAuthenticationConditionalUI,"
-                "Vulkan,SkiaRenderer,CanvasOopRasterization");
+                "WebAuthentication,WebAuthenticationConditionalUI");
 
-            // GPU acceleration
+            // GPU: CEF 142 uses ANGLE for GL. The bundled libEGL.so/libGLESv2.so
+            // provide the EGL backend. Do NOT use --use-gl=desktop (removed in
+            // Chromium ~100+). Do NOT disable software rasterizer (SwiftShader
+            // fallback is essential when GPU init fails).
             command_line->AppendSwitch("ignore-gpu-blocklist");
-            command_line->AppendSwitch("enable-gpu-rasterization");
-            command_line->AppendSwitch("enable-oop-rasterization");
-            command_line->AppendSwitch("enable-zero-copy");
-
-            // Use native OpenGL on Linux
-            command_line->AppendSwitchWithValue("use-gl", "desktop");
-
-            // Disable software compositing fallback
-            command_line->AppendSwitch("disable-software-rasterizer");
+            command_line->AppendSwitchWithValue("use-gl", "egl");
+            command_line->AppendSwitchWithValue("use-angle", "opengl");
 
             // Set unique app-id for window managers (Wayland app_id / X11 WM_CLASS)
             command_line->AppendSwitchWithValue("class", "pulse-vpn-auth");
