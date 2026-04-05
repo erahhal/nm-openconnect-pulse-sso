@@ -230,6 +230,17 @@ class PulseSSOPlugin(dbus.service.Object):
         # Count consecutive auth failures to prevent infinite loops
         self._auth_failure_count: int = 0
 
+        # Track whether the current cookie was freshly obtained from auth
+        # dialog (True) or is a stale internally-stored cookie from a
+        # previous session (False). Stale cookie rejection after a
+        # rebuild/resume is expected and should not count as auth failure.
+        self._cookie_is_fresh: bool = False
+
+        # When True, the next re-activation should use a longer delay to
+        # give the VPN server time to clean up the old session after an
+        # ungraceful tunnel termination (e.g., nixos-rebuild, network loss).
+        self._needs_post_disruption_delay: bool = False
+
         # Flag to prevent Disconnect() from quitting when we're about to trigger
         # browser re-auth (prevents race with NM calling Disconnect after StateChanged)
         self._reconnection_pending: bool = False
@@ -642,32 +653,47 @@ class PulseSSOPlugin(dbus.service.Object):
 
         # Exit code 2 means auth failure — cookie is invalid
         if exit_code == 2:
-            logger.warning("Auth failure (exit code 2) — cookie invalid, clearing")
+            was_fresh = self._cookie_is_fresh
+            logger.warning(
+                "Auth failure (exit code 2) — cookie invalid (fresh=%s), clearing",
+                was_fresh,
+            )
             self.cookie = None
+            self._cookie_is_fresh = False
             if self.gateway and not self._disconnect_requested:
-                self._auth_failure_count += 1
-                if self._auth_failure_count <= 2:
-                    # Session expired — trigger fresh authentication.
-                    # Allow up to 2 attempts: some servers need two roundtrips
-                    # after a long idle (e.g. resume after 24h session expiry).
+                if not was_fresh:
+                    # Stale cookie rejected — expected after rebuild/resume.
+                    # Don't count toward auth failure limit; just re-auth.
                     logger.info(
-                        "Setting reconnection pending for re-authentication "
-                        "(auth failure %d/2)",
-                        self._auth_failure_count,
+                        "Stale cookie rejected — requesting fresh authentication"
                     )
+                    self._needs_post_disruption_delay = True
                     self._reconnection_pending = True
                 else:
-                    logger.warning(
-                        "Auth failure %d times consecutively — staying stopped "
-                        "to avoid re-auth loop",
-                        self._auth_failure_count,
-                    )
+                    # Fresh cookie rejected — something is actually wrong.
+                    self._auth_failure_count += 1
+                    if self._auth_failure_count <= 1:
+                        logger.info(
+                            "Fresh cookie rejected (auth failure %d/1) — "
+                            "retrying once",
+                            self._auth_failure_count,
+                        )
+                        self._reconnection_pending = True
+                    else:
+                        logger.warning(
+                            "Fresh cookie rejected %d times — staying stopped "
+                            "to avoid re-auth loop",
+                            self._auth_failure_count,
+                        )
             self.StateChanged(ServiceState.Stopped)
             return
 
         # Non-auth failure with valid cookie — NM reactive Disconnect() will
         # schedule fast re-activation via ActivateConnection D-Bus API
         if self.cookie and self.gateway:
+            # Signal that the next re-activation should wait longer for
+            # server-side session cleanup after ungraceful tunnel death.
+            self._needs_post_disruption_delay = True
             self._consecutive_restart_failures += 1
             logger.warning(
                 "openconnect exited unexpectedly (attempt %d), "
@@ -1283,8 +1309,18 @@ class PulseSSOPlugin(dbus.service.Object):
                 )
                 self._schedule_direct_auth(5000)
             else:
-                logger.error("Auth-dialog failed after all launch strategies")
-                self._schedule_auth_retry("All launch strategies failed")
+                # Non-transient failure (e.g. user closed browser, real auth error).
+                # Do not retry — stop reconnection and clean up.
+                logger.warning(
+                    "Auth-dialog failed with non-transient error — stopping reconnection"
+                )
+                self._reconnection_pending = False
+                try:
+                    os.unlink("/run/vpn-auto-reconnect")
+                except FileNotFoundError:
+                    pass
+                self.StateChanged(ServiceState.Stopped)
+                self.Failure("VPN authentication cancelled or failed")
             return
 
         launch_cmd = self._auth_launch_commands[self._auth_launch_index]
@@ -1407,7 +1443,6 @@ class PulseSSOPlugin(dbus.service.Object):
             is_transient = (
                 "Transport endpoint" in stderr_text
                 or "CEF initialization failed" in stderr_text
-                or "CEF authentication failed" in stderr_text
                 or "Cannot connect to" in stderr_text  # TCP check from auth-dialog
             )
 
@@ -1454,6 +1489,7 @@ class PulseSSOPlugin(dbus.service.Object):
         # Success! Update credentials and start openconnect
         logger.info("Got fresh cookie from auth-dialog, starting openconnect")
         self.cookie = cookie
+        self._cookie_is_fresh = True
         self.servercert = gwcert
 
         self.StateChanged(ServiceState.Starting)
@@ -1463,9 +1499,10 @@ class PulseSSOPlugin(dbus.service.Object):
             self._reconnection_pending = False
             self._reconnection_retry_count = 0
             # Note: _auth_failure_count is intentionally NOT reset here.
-            # It tracks exit-code-2 failures since the last working VPN tunnel
-            # (SetIp4Config). Resetting here would allow infinite re-auth loops
-            # if the server rejects every fresh cookie.
+            # It tracks fresh-cookie exit-code-2 failures since the last
+            # working VPN tunnel (SetIp4Config). Resetting here would
+            # allow infinite re-auth loops if the server keeps rejecting
+            # fresh cookies.
             self._cancel_direct_auth_timer()
         except Exception as e:
             logger.exception("Failed to start openconnect after auth: %s", e)
@@ -1688,6 +1725,9 @@ class PulseSSOPlugin(dbus.service.Object):
             # If auth dialog is running or scheduled, preserve it.
             # NM's Disconnect/re-activate cycle would otherwise kill the dialog
             # and launch a new one, causing duplicate auth popups.
+            # Note: NM's state machine sends Disconnect() in reaction to
+            # StateChanged(Starting) emitted from Connect(), so this path
+            # is hit during normal reconnection — not just user disconnect.
             if self._auth_dialog_proc is not None or self._direct_auth_timeout_id is not None:
                 logger.info(
                     "Disconnect during active auth — preserving auth flow, "
@@ -1698,8 +1738,18 @@ class PulseSSOPlugin(dbus.service.Object):
                     GLib.source_remove(self._reactivation_timeout_id)
                 self._reactivation_retry_count = 0
                 self._is_reactivation = True
+                if self._needs_post_disruption_delay:
+                    delay = 8000  # 8s for server session cleanup
+                    self._needs_post_disruption_delay = False
+                    logger.info(
+                        "Using extended %dms delay for server session cleanup "
+                        "(auth dialog active)",
+                        delay,
+                    )
+                else:
+                    delay = 500
                 self._reactivation_timeout_id = GLib.timeout_add(
-                    500, self._reactivate_vpn_via_nm
+                    delay, self._reactivate_vpn_via_nm
                 )
                 return
 
@@ -1726,8 +1776,17 @@ class PulseSSOPlugin(dbus.service.Object):
                 logger.info("Scheduling VPN re-activation through NetworkManager")
                 self._reactivation_retry_count = 0
                 self._is_reactivation = True
+                if self._needs_post_disruption_delay:
+                    delay = 8000  # 8s for server session cleanup
+                    self._needs_post_disruption_delay = False
+                    logger.info(
+                        "Using extended %dms delay for server session cleanup",
+                        delay,
+                    )
+                else:
+                    delay = 500
                 self._reactivation_timeout_id = GLib.timeout_add(
-                    500, self._reactivate_vpn_via_nm
+                    delay, self._reactivate_vpn_via_nm
                 )
             else:
                 logger.info("No credentials for re-activation, staying stopped")
@@ -1770,6 +1829,7 @@ class PulseSSOPlugin(dbus.service.Object):
             self._cancel_direct_auth_timer()
             self._kill_auth_dialog()
             self._reconnection_pending = False
+            self._needs_post_disruption_delay = False
 
             # Cancel any pending re-activation
             if self._reactivation_timeout_id is not None:
@@ -1875,6 +1935,8 @@ class PulseSSOPlugin(dbus.service.Object):
                 "Resetting auth failure count (was %d)", self._auth_failure_count
             )
             self._auth_failure_count = 0
+        self._cookie_is_fresh = False
+        self._needs_post_disruption_delay = False
 
         if self._total_auth_launch_failures > 0:
             logger.info(

@@ -83,6 +83,26 @@ let
       --timeout 3600
   '';
 
+  # Reset tool to clear the browser profile
+  pulse-browser-reset = pkgs.writeShellScriptBin "pulse-browser-reset" ''
+    PROFILE_DIR="$HOME/.cache/pulse-browser-auth"
+    if [ ! -d "$PROFILE_DIR" ]; then
+      echo "No browser profile found at $PROFILE_DIR"
+      exit 0
+    fi
+    echo "This will delete the browser profile at:"
+    echo "  $PROFILE_DIR"
+    echo ""
+    printf "Continue? [y/N] "
+    read -r answer
+    case "$answer" in
+      [yY]|[yY][eE][sS]) ;;
+      *) echo "Aborted."; exit 0 ;;
+    esac
+    rm -rf "$PROFILE_DIR"
+    echo "Browser profile removed. Extensions will be re-installed on next VPN auth."
+  '';
+
   # Diagnostic script with substituted paths
   diagnose-nm-pulse-vpn = pkgs.runCommand "diagnose-nm-pulse-vpn" { } ''
     mkdir -p $out/bin
@@ -328,6 +348,7 @@ in
     ] ++ lib.optionals (!cfg.enableSelenium) [
       pulse-browser-auth
       pulse-browser-setup
+      pulse-browser-reset
     ];
 
     # D-Bus policy is installed by the package
