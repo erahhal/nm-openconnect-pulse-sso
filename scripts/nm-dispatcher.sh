@@ -93,13 +93,67 @@ fi
 
 if [ -z "$TARGET_GW" ] || [ -z "$TARGET_DEV" ]; then
     # If openconnect is running and an interface went down with no other
-    # gateway available, the VPN route is broken.  Kill openconnect now;
-    # when a new interface comes UP the "openconnect not running" path
-    # (line 56-61) will trigger vpn-auto-reconnect.
+    # gateway available, the VPN route is broken.  Kill openconnect now
+    # and ensure the new interface gets a working default route.
+    #
+    # Why the route can be missing: when a new interface (e.g. dock ethernet)
+    # activates while a VPN is active, NM adds the interface's default route
+    # then immediately removes it because the VPN has higher routing priority.
+    # When the VPN is then torn down, vpnc-script tries to restore the
+    # pre-VPN default route — but that was on the OLD interface (now down),
+    # so restoration fails.  NM doesn't re-evaluate the new interface's
+    # routes after VPN teardown, leaving no default route at all.
     if [ -n "$OPENCONNECT_PID" ] && [ "$ACTION" = "down" ]; then
         log_msg "No gateway available after $IFACE went down — killing openconnect (PID: $OPENCONNECT_PID)"
         kill -TERM "$OPENCONNECT_PID" 2>/dev/null || true
+
+        # Wait for openconnect to exit so VPN teardown completes
+        for i in 1 2 3 4 5; do
+            sleep 1
+            if ! kill -0 "$OPENCONNECT_PID" 2>/dev/null; then
+                break
+            fi
+            if [ "$i" = "5" ]; then
+                kill -9 "$OPENCONNECT_PID" 2>/dev/null || true
+            fi
+        done
+
+        # Give NM time to finish VPN teardown and route cleanup
+        sleep 2
+
+        # Find the active physical interface and ensure it has a default route
+        for dev in $(ls /sys/class/net/ | grep -v -E "^(lo|tun|tap|docker|br-|veth|tailscale)"); do
+            if [ -f "/sys/class/net/$dev/carrier" ]; then
+                CARRIER=$(cat "/sys/class/net/$dev/carrier" 2>/dev/null || echo "0")
+                if [ "$CARRIER" = "1" ] && [ "$dev" != "$IFACE" ]; then
+                    GW=$(@iproute2@/bin/ip route show default dev "$dev" 2>/dev/null | @gawk@/bin/awk '{print $3}' | head -1)
+                    if [ -z "$GW" ]; then
+                        log_msg "No default route on $dev after VPN teardown — reapplying connection"
+                        @networkmanager@/bin/nmcli device reapply "$dev" 2>/dev/null || true
+                        sleep 1
+                        GW=$(@iproute2@/bin/ip route show default dev "$dev" 2>/dev/null | @gawk@/bin/awk '{print $3}' | head -1)
+                        if [ -z "$GW" ]; then
+                            log_msg "Reapply failed — bouncing $dev connection"
+                            CONN=$(@networkmanager@/bin/nmcli -t -f NAME,DEVICE connection show --active 2>/dev/null | grep ":${dev}$" | head -1 | cut -d: -f1)
+                            if [ -n "$CONN" ]; then
+                                @networkmanager@/bin/nmcli connection down "$CONN" 2>/dev/null || true
+                                sleep 1
+                                @networkmanager@/bin/nmcli connection up "$CONN" 2>/dev/null || true
+                            fi
+                        fi
+                    fi
+                    break
+                fi
+            fi
+        done
         # Don't write cooldown file — next UP event should reconnect freely
+    elif [ -n "$OPENCONNECT_PID" ] && [ "$ACTION" = "up" ]; then
+        # Interface came up but has no default route yet.  This happens when
+        # NM suppresses the new interface's default route because the VPN
+        # (on the old interface) still has priority.  Don't kill the VPN
+        # here — the paired "down" event for the old interface will handle
+        # that.  Just log it so the timeline is clear.
+        log_msg "Interface $IFACE up but no default route yet (VPN likely suppressing) — waiting for old interface down event"
     else
         log_msg "No suitable gateway/interface found"
     fi

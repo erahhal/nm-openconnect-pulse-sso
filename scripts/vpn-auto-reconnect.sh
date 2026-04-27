@@ -61,6 +61,36 @@ if [ "$nm_was_ready" != "yes" ]; then
     sleep 3
 fi
 
+# Verify a default route exists.  NM reports "connected" even when the
+# default route is missing (e.g. after VPN teardown raced with an interface
+# change).  Without a default route, every VPN connection attempt will fail
+# immediately.  Fix by reapplying the active connection.
+HAS_DEFAULT=$(@iproute2@/bin/ip route show default 2>/dev/null | head -1)
+if [ -z "$HAS_DEFAULT" ]; then
+    echo "No default route — attempting to repair"
+    for dev in $(ls /sys/class/net/ | grep -v -E "^(lo|tun|tap|docker|br-|veth|tailscale)"); do
+        if [ -f "/sys/class/net/$dev/carrier" ]; then
+            CARRIER=$(cat "/sys/class/net/$dev/carrier" 2>/dev/null || echo "0")
+            if [ "$CARRIER" = "1" ]; then
+                @networkmanager@/bin/nmcli device reapply "$dev" 2>/dev/null || true
+                sleep 1
+                HAS_DEFAULT=$(@iproute2@/bin/ip route show default 2>/dev/null | head -1)
+                if [ -z "$HAS_DEFAULT" ]; then
+                    CONN=$(@networkmanager@/bin/nmcli -t -f NAME,DEVICE connection show --active 2>/dev/null | grep ":${dev}$" | head -1 | cut -d: -f1)
+                    if [ -n "$CONN" ]; then
+                        echo "Reapply failed — bouncing $dev ($CONN)"
+                        @networkmanager@/bin/nmcli connection down "$CONN" 2>/dev/null || true
+                        sleep 1
+                        @networkmanager@/bin/nmcli connection up "$CONN" 2>/dev/null || true
+                        sleep 2
+                    fi
+                fi
+                break
+            fi
+        fi
+    done
+fi
+
 # Flush DNS caches (stale after resume)
 @systemd@/bin/resolvectl flush-caches 2>/dev/null || true
 @systemd@/bin/resolvectl reset-server-features 2>/dev/null || true

@@ -420,6 +420,15 @@ class PulseSSOPlugin(dbus.service.Object):
             self._reconnection_retry_count = 0
             self._consecutive_restart_failures = 0
 
+            # Cancel any pending re-activation timer from a previous cycle.
+            # When auto-reconnect or NM triggers a new Connect while a
+            # re-activation is still scheduled, the old timer is stale.
+            # Leaving it set causes Disconnect() to misidentify NM's
+            # reactive cleanup as a user disconnect and quit the service.
+            if self._reactivation_timeout_id is not None:
+                GLib.source_remove(self._reactivation_timeout_id)
+                self._reactivation_timeout_id = None
+
             self._start_openconnect()
 
         except LaunchFailedError:
