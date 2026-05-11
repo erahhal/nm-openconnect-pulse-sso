@@ -202,6 +202,12 @@ class PulseSSOPlugin(dbus.service.Object):
         self.gateway: Optional[str] = None
         self.cookie: Optional[str] = None
         self.servercert: Optional[str] = None
+        # Optional "HOST:IP" override for openconnect's --resolve. Set by the
+        # browser-auth backend (proxy.py resolves the gateway via DoH while
+        # building the MITM cert chain) so openconnect can dial the real IP
+        # directly without going through the /etc/hosts loopback redirect
+        # that we install for the browser. Always None for the CEF backend.
+        self.resolve: Optional[str] = None
 
         # Pending connection for interactive flow
         self.pending_connection: Optional[dict] = None
@@ -413,6 +419,9 @@ class PulseSSOPlugin(dbus.service.Object):
             vpn_secrets = connection.get("vpn", {}).get("secrets", {})
             cookie = vpn_secrets.get("cookie", "")
             servercert = vpn_secrets.get("gwcert", "")
+            # Optional "HOST:IP" override for the browser-auth backend; see
+            # __init__ for why we need it.
+            resolve = vpn_secrets.get("resolve", "")
 
             if not gateway:
                 raise LaunchFailedError("No gateway specified in VPN configuration")
@@ -432,6 +441,7 @@ class PulseSSOPlugin(dbus.service.Object):
             self.gateway = gateway
             self.cookie = cookie
             self.servercert = servercert
+            self.resolve = resolve or None
 
             # Reset disconnect flag - we're starting a new connection
             self._disconnect_requested = False
@@ -597,6 +607,24 @@ class PulseSSOPlugin(dbus.service.Object):
             cmd.append(f"--mtu={vpn_mtu}")
             logger.info("VPN MTU override: %d", vpn_mtu)
 
+        # If the browser-auth backend supplied a HOST:IP override, tell
+        # openconnect about it: --resolve bypasses /etc/hosts (which still
+        # points the gateway at 127.0.0.1 for the browser-side MITM proxy).
+        #
+        # We do NOT pass --servercert here. The proxy captures a SHA-256 of
+        # the full DER cert (sha256:hex), but openconnect's --servercert
+        # comparison uses an SPKI pin (pin-sha256:base64, RFC 7469), so the
+        # two never match — you get "None of the 1 fingerprint(s) match"
+        # before the tunnel can even start. The pcs.flxvpn.net cert is
+        # publicly signed, so standard PKI validation against the system CA
+        # bundle is sufficient — openconnect still validates the cert against
+        # the original SNI hostname (pcs.flxvpn.net), not the IP we resolved
+        # to. self.servercert is still kept in memory / NM secrets for
+        # diagnostic logging.
+        if self.resolve:
+            cmd.append(f"--resolve={self.resolve}")
+            logger.info("openconnect --resolve=%s", self.resolve)
+
         cmd.extend(
             [
                 "-C",
@@ -617,17 +645,48 @@ class PulseSSOPlugin(dbus.service.Object):
         env = os.environ.copy()
         env["NM_DBUS_SERVICE_PULSE_SSO"] = NM_DBUS_SERVICE
 
-        # Redirect stdin to avoid blocking, but keep stderr for logging
-        # stdout goes to devnull, stderr goes to our stderr (which goes to journal)
+        # Redirect stdin to avoid blocking. Capture stderr into a pipe so we
+        # can drain it on a thread and forward each line through the Python
+        # logger — that gives us per-line timestamps AND lets us re-emit the
+        # final few lines on unexpected-exit, instead of relying on whatever
+        # systemd-journald happened to buffer.
         import subprocess
+        import threading
+        from collections import deque
 
         self.proc = Popen(
             cmd,
             env=env,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
-            stderr=None,  # Inherit stderr so errors go to journal
+            stderr=subprocess.PIPE,
         )
+
+        # Ring buffer of the last N stderr lines, used by _on_openconnect_exit
+        # to dump context when openconnect bails fast.
+        self._openconnect_stderr_tail = deque(maxlen=50)
+
+        def _drain_stderr(stream, tail):
+            try:
+                for raw in iter(stream.readline, b""):
+                    line = raw.decode("utf-8", errors="replace").rstrip()
+                    if not line:
+                        continue
+                    tail.append(line)
+                    logger.info("openconnect: %s", line)
+            except Exception as exc:
+                logger.debug("stderr drain stopped: %s", exc)
+            finally:
+                try:
+                    stream.close()
+                except Exception:
+                    pass
+
+        threading.Thread(
+            target=_drain_stderr,
+            args=(self.proc.stderr, self._openconnect_stderr_tail),
+            daemon=True,
+        ).start()
 
         logger.info("openconnect started with PID %d", self.proc.pid)
 
@@ -671,6 +730,22 @@ class PulseSSOPlugin(dbus.service.Object):
             exit_code = status
 
         logger.info("openconnect (PID %d) exited with code %d", pid, exit_code)
+
+        # If openconnect bailed fast (< 1s), the stderr drain thread may have
+        # already logged lines but they can be hard to find in the firehose.
+        # Re-emit the last few buffered lines so the exit reason is right
+        # next to the exit-code log line.
+        tail = getattr(self, "_openconnect_stderr_tail", None)
+        if tail:
+            recent = list(tail)[-10:]
+            if recent:
+                logger.info(
+                    "openconnect last %d stderr line(s):", len(recent)
+                )
+                for line in recent:
+                    logger.info("  | %s", line)
+            else:
+                logger.info("openconnect produced no stderr output")
 
         # Clear process reference
         self.proc = None
@@ -730,6 +805,43 @@ class PulseSSOPlugin(dbus.service.Object):
                 "waiting for NM re-activation...",
                 self._consecutive_restart_failures,
             )
+
+            # Death-spiral short-circuit: in the browser-auth backend, a fast
+            # openconnect failure (< 1.5s, exit code 1 with no protocol
+            # negotiation) almost always means our --resolve / proxy plumbing
+            # is broken — NOT that the cookie is stale on the server side.
+            # Retrying 4 more times with the same cookie + same broken
+            # plumbing wastes ~20s and gives the user no feedback. Bail to
+            # fresh auth on the FIRST failure so they can recover quickly.
+            browser_auth_active = bool(self.resolve)
+            if browser_auth_active and self._cookie_is_fresh \
+                    and self._consecutive_restart_failures == 1:
+                tail = list(getattr(self, "_openconnect_stderr_tail", []) or [])
+                fast_ssl_fail = any(
+                    "Creating SSL connection failed" in line
+                    or "Failed to connect to host" in line
+                    for line in tail
+                )
+                if fast_ssl_fail:
+                    logger.error(
+                        "browser-auth: openconnect failed to reach gateway "
+                        "(no protocol negotiation). Cookie was fresh, so this "
+                        "is a plumbing problem (proxy / --resolve / NAT) — "
+                        "clearing state and re-triggering auth immediately "
+                        "instead of looping."
+                    )
+                    self._consecutive_restart_failures = 0
+                    self.cookie = None
+                    self.resolve = None
+                    self.servercert = None
+                    self._cookie_is_fresh = False
+                    if self.gateway and not self._disconnect_requested:
+                        self._reconnection_pending = True
+                        self._emit_starting()
+                        self._schedule_direct_auth(1000)
+                    else:
+                        self.StateChanged(ServiceState.Stopped)
+                    return
 
             if self._consecutive_restart_failures >= 5:
                 # Too many consecutive failures — cookie likely stale/IP-bound.
@@ -1604,6 +1716,7 @@ class PulseSSOPlugin(dbus.service.Object):
         lines = stdout.decode().strip().split("\n")
         cookie = None
         gwcert = None
+        resolve = None
         i = 0
         while i < len(lines):
             if lines[i] == "cookie" and i + 1 < len(lines):
@@ -1611,6 +1724,11 @@ class PulseSSOPlugin(dbus.service.Object):
                 i += 2
             elif lines[i] == "gwcert" and i + 1 < len(lines):
                 gwcert = lines[i + 1]
+                i += 2
+            elif lines[i] == "resolve" and i + 1 < len(lines):
+                # "HOST:IP" — emitted by the browser-auth dialog so we can
+                # tell openconnect to bypass /etc/hosts.
+                resolve = lines[i + 1]
                 i += 2
             else:
                 i += 1
@@ -1625,11 +1743,22 @@ class PulseSSOPlugin(dbus.service.Object):
             logger.info("Disconnect requested, discarding auth result")
             return
 
-        # Success! Update credentials and start openconnect
-        logger.info("Got fresh cookie from auth-dialog, starting openconnect")
+        # Success! Update credentials and start openconnect.
+        # Log a short fingerprint (length + first/last 4 chars) so we can
+        # correlate this cookie against the proxy log without leaking the
+        # bearer token to the journal.
+        _ck_prefix = cookie[:4]
+        _ck_suffix = cookie[-4:] if len(cookie) > 8 else ""
+        _gw_short = (gwcert or "")[:24] + ("…" if len(gwcert or "") > 24 else "")
+        logger.info(
+            "Got fresh cookie from auth-dialog (len=%d prefix=%r suffix=%r "
+            "gwcert=%s resolve=%s), starting openconnect",
+            len(cookie), _ck_prefix, _ck_suffix, _gw_short, resolve or "<none>",
+        )
         self.cookie = cookie
         self._cookie_is_fresh = True
         self.servercert = gwcert
+        self.resolve = resolve
 
         self._emit_starting()
         try:
@@ -1681,6 +1810,8 @@ class PulseSSOPlugin(dbus.service.Object):
                 connection.setdefault("vpn", {}).setdefault("secrets", {})["cookie"] = self.cookie
                 if self.servercert:
                     connection["vpn"]["secrets"]["gwcert"] = self.servercert
+                if self.resolve:
+                    connection["vpn"]["secrets"]["resolve"] = self.resolve
                 self._do_connect(connection)
                 return
 
@@ -1755,6 +1886,8 @@ class PulseSSOPlugin(dbus.service.Object):
                 connection.setdefault("vpn", {}).setdefault("secrets", {})["cookie"] = self.cookie
                 if self.servercert:
                     connection["vpn"]["secrets"]["gwcert"] = self.servercert
+                if self.resolve:
+                    connection["vpn"]["secrets"]["resolve"] = self.resolve
                 self._do_connect(connection)
                 return
 
@@ -1871,6 +2004,7 @@ class PulseSSOPlugin(dbus.service.Object):
                 self.cookie = None
                 self.gateway = None
                 self.servercert = None
+                self.resolve = None
                 self.pending_connection = None
 
                 self._clear_cached_secrets()
@@ -1975,6 +2109,7 @@ class PulseSSOPlugin(dbus.service.Object):
                 self.cookie = None
                 self.gateway = None
                 self.servercert = None
+                self.resolve = None
                 self.pending_connection = None
 
                 # Drop any cached secret in NM so a future Connect prompts fresh auth

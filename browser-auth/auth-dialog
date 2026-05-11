@@ -1,0 +1,250 @@
+#!/usr/bin/env python3
+"""
+NetworkManager auth-dialog for Pulse SSO VPN (native browser backend).
+
+Starts a local HTTPS MITM proxy, then opens the VPN URL in the user's default
+browser. /etc/hosts redirects the VPN hostname to the proxy, which forwards to
+the real server and captures the DSID cookie from Set-Cookie response headers.
+
+Protocol (same as other auth-dialog implementations):
+  stdin:  DATA_KEY/DATA_VAL/SECRET_KEY/SECRET_VAL pairs, terminated by DONE
+  stdout: key/value pairs (cookie, gwcert), then waits for QUIT
+"""
+
+import argparse
+import json
+import os
+import select
+import signal
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+
+
+_proxy_pid: "int | None" = None
+
+
+def _terminate_handler(signum, _frame):
+    global _proxy_pid
+    pid = _proxy_pid
+    if pid:
+        try:
+            os.killpg(pid, signal.SIGKILL)
+        except (OSError, ProcessLookupError):
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except (OSError, ProcessLookupError):
+                pass
+    os._exit(128 + signum)
+
+
+signal.signal(signal.SIGTERM, _terminate_handler)
+signal.signal(signal.SIGINT, _terminate_handler)
+
+
+def read_vpn_details():
+    data = {}
+    secrets = {}
+    while True:
+        line = sys.stdin.readline()
+        if not line:
+            break
+        line = line.strip()
+        if line == "DONE":
+            break
+        elif line.startswith("DATA_KEY="):
+            key = line[9:]
+            val_line = sys.stdin.readline().strip()
+            if val_line.startswith("DATA_VAL="):
+                data[key] = val_line[9:]
+        elif line.startswith("SECRET_KEY="):
+            key = line[11:]
+            val_line = sys.stdin.readline().strip()
+            if val_line.startswith("SECRET_VAL="):
+                secrets[key] = val_line[11:]
+    return data, secrets
+
+
+def wait_for_quit(timeout: int = 20):
+    while True:
+        readable, _, _ = select.select([sys.stdin], [], [], timeout)
+        if not readable:
+            break
+        line = sys.stdin.readline()
+        if not line or line.strip() == "QUIT":
+            break
+
+
+def wait_for_proxy(port: int, timeout: float = 15.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            s = socket.create_connection(("127.0.0.1", port), timeout=0.2)
+            s.close()
+            return True
+        except OSError:
+            time.sleep(0.1)
+    return False
+
+
+def main():
+    ap = argparse.ArgumentParser(description="NM auth-dialog: native browser backend")
+    ap.add_argument("-u", "--uuid")
+    ap.add_argument("-n", "--name")
+    ap.add_argument("-s", "--service")
+    ap.add_argument("-i", "--interactive", action="store_true")
+    ap.add_argument("-r", "--reprompt", action="store_true")
+    ap.add_argument("-t", "--hint", action="append")
+    ap.add_argument("--external-ui-mode", action="store_true")
+    ap.add_argument("--proxy-binary", required=True, help="Path to proxy binary")
+    ap.add_argument("--cert", required=True, help="Local TLS certificate (PEM)")
+    ap.add_argument("--key", required=True, help="Local TLS private key (PEM)")
+    ap.add_argument("--proxy-port", type=int, default=8443)
+    args = ap.parse_args()
+
+    data, secrets = read_vpn_details()
+
+    gateway = data.get("gateway", "")
+    if not gateway:
+        print("Error: no gateway in connection data", file=sys.stderr)
+        sys.exit(1)
+
+    if not gateway.startswith("http"):
+        gateway = f"https://{gateway}"
+
+    hostname = (
+        gateway
+        .removeprefix("https://")
+        .removeprefix("http://")
+        .split("/")[0]
+        .split(":")[0]
+    )
+
+    # Return cached cookie if still valid and not forcing reprompt
+    existing_cookie = secrets.get("cookie", "")
+    if existing_cookie and not args.reprompt:
+        print("cookie")
+        print(existing_cookie)
+        if "gwcert" in secrets:
+            print("gwcert")
+            print(secrets["gwcert"])
+        if "resolve" in secrets:
+            print("resolve")
+            print(secrets["resolve"])
+        sys.stdout.flush()
+        wait_for_quit()
+        return 0
+
+    result_fd, result_file = tempfile.mkstemp(suffix=".json", prefix="pulse-dsid-")
+    os.close(result_fd)
+
+    # Persistent log file for forensics. Tied to the result file's random
+    # suffix so reset.sh can find/clean both in one shot.
+    log_file = result_file.replace(".json", ".log")
+
+    try:
+        proxy_cmd = [
+            args.proxy_binary,
+            "--hostname", hostname,
+            "--cert", args.cert,
+            "--key", args.key,
+            "--port", str(args.proxy_port),
+            "--output", result_file,
+            "--log-file", log_file,
+        ]
+
+        proxy_proc = subprocess.Popen(
+            proxy_cmd,
+            stderr=sys.stderr,
+            start_new_session=True,
+        )
+        global _proxy_pid
+        _proxy_pid = proxy_proc.pid
+
+        if not wait_for_proxy(args.proxy_port):
+            proxy_proc.kill()
+            print("Proxy failed to start within 15 seconds", file=sys.stderr)
+            sys.exit(1)
+
+        print(f"Opening browser: {gateway}", file=sys.stderr)
+        subprocess.Popen(["xdg-open", gateway])
+
+        try:
+            proxy_proc.wait(timeout=310)
+        except subprocess.TimeoutExpired:
+            proxy_proc.kill()
+            print("Authentication timed out", file=sys.stderr)
+            sys.exit(1)
+
+        if proxy_proc.returncode != 0:
+            print("Authentication failed (proxy exited with error)", file=sys.stderr)
+            sys.exit(1)
+
+        with open(result_file) as f:
+            result = json.load(f)
+
+        dsid = result.get("dsid", "")
+        gwcert = result.get("gwcert", "")
+        resolve = result.get("resolve", "")
+
+        if not dsid:
+            print("No DSID in proxy output", file=sys.stderr)
+            # Surface what we DID see so the user can correlate against the
+            # proxy log. Candidates list is bounded by what the proxy saw.
+            for c in result.get("candidates", []):
+                print(f"  candidate: len={len(c.get('dsid',''))} "
+                      f"status={c.get('response_status')} "
+                      f"path={c.get('request_path')!r}", file=sys.stderr)
+            sys.exit(1)
+
+        # Diagnostic summary written to stderr (journal). NEVER print the
+        # full cookie value — it's a bearer token. Log length and a short
+        # fingerprint instead so we can correlate this hop against the proxy
+        # log and the openconnect side without leaking the secret.
+        prefix = dsid[:4]
+        suffix = dsid[-4:] if len(dsid) > 8 else ""
+        print(f"auth-dialog: returning DSID len={len(dsid)} "
+              f"prefix={prefix!r} suffix={suffix!r} "
+              f"candidates_seen={len(result.get('candidates', []))}",
+              file=sys.stderr)
+
+        print("cookie")
+        print(dsid)
+        if gwcert:
+            print("gwcert")
+            print(gwcert)
+        if resolve:
+            # Tells the VPN service to invoke openconnect with --resolve so
+            # it bypasses the /etc/hosts override (which still points the
+            # gateway hostname at 127.0.0.1 even after the proxy exits).
+            print("resolve")
+            print(resolve)
+        sys.stdout.flush()
+
+        wait_for_quit()
+        return 0
+
+    finally:
+        try:
+            os.unlink(result_file)
+        except OSError:
+            pass
+        # Leave the log file behind on purpose — it's the diagnostic trail
+        # for any failed auth. reset.sh cleans these up. Log files older than
+        # 24h are pruned here as a safety net so /tmp doesn't accumulate.
+        try:
+            cutoff = time.time() - 24 * 3600
+            for entry in os.scandir("/tmp"):
+                if entry.name.startswith("pulse-dsid-") and \
+                   entry.name.endswith(".log") and \
+                   entry.stat().st_mtime < cutoff:
+                    os.unlink(entry.path)
+        except OSError:
+            pass
+        _proxy_pid = None
+
+
+if __name__ == "__main__":
+    sys.exit(main())

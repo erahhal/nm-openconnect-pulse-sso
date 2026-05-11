@@ -7,6 +7,46 @@
 let
   cfg = config.services.nm-pulse-sso;
 
+  # Extract bare hostname from gateway URL (e.g. "https://pcs.flxvpn.net/emp" → "pcs.flxvpn.net")
+  gateway-hostname =
+    let
+      withoutProtocol =
+        if lib.hasPrefix "https://" cfg.gateway then lib.removePrefix "https://" cfg.gateway
+        else if lib.hasPrefix "http://"  cfg.gateway then lib.removePrefix "http://"  cfg.gateway
+        else cfg.gateway;
+      withoutPath = builtins.head (lib.splitString "/" withoutProtocol);
+    in builtins.head (lib.splitString ":" withoutPath);
+
+  # Local CA + server cert for the browser-auth MITM proxy.
+  # Generated at build time; CA cert is added to the system trust store so the
+  # user's browser accepts the proxy's TLS certificate.
+  # NOTE: private key lives in /nix/store (world-readable on this machine).
+  # This is an acceptable trade-off: it only enables MITM of a single VPN
+  # hostname by local users on this specific host.
+  browser-auth-pki = pkgs.runCommand "pulse-browser-auth-pki"
+    { nativeBuildInputs = [ pkgs.openssl ]; }
+    ''
+      mkdir -p $out
+      HOSTNAME="${gateway-hostname}"
+
+      # CA key + self-signed cert
+      openssl genrsa -out $out/ca.key 2048
+      openssl req -new -x509 -days 3650 \
+        -key $out/ca.key -out $out/ca.crt \
+        -subj "/CN=Pulse Browser Auth Local CA"
+
+      # Server key + cert signed by CA, with SAN for the gateway hostname
+      openssl genrsa -out $out/server.key 2048
+      openssl req -new \
+        -key $out/server.key -out $out/server.csr \
+        -subj "/CN=$HOSTNAME"
+      openssl x509 -req -days 3650 \
+        -in $out/server.csr \
+        -CA $out/ca.crt -CAkey $out/ca.key -CAcreateserial \
+        -out $out/server.crt \
+        -extfile <(printf 'subjectAltName=DNS:%s\n' "$HOSTNAME")
+    '';
+
   # CEF-based authentication browser
   pulse-browser-auth-base = pkgs.callPackage ./cef-auth/default.nix { };
 
@@ -63,12 +103,20 @@ let
       '';
     };
 
-  # Select implementation based on enableSelenium option
-  nm-pulse-sso = if cfg.enableSelenium
-    then pkgs.callPackage ./default-selenium.nix { }
-    else pkgs.callPackage ./default.nix {
-      cef-pulse-auth = pulse-browser-auth;
-    };
+  # Select implementation based on backend option
+  nm-pulse-sso =
+    if cfg.enableSelenium then
+      pkgs.callPackage ./default-selenium.nix { }
+    else if cfg.enableDesktopBrowserAuth then
+      pkgs.callPackage ./browser-auth/default.nix {
+        cert = "${browser-auth-pki}/server.crt";
+        key  = "${browser-auth-pki}/server.key";
+        proxyPort = cfg.browserAuthProxyPort;
+      }
+    else
+      pkgs.callPackage ./default.nix {
+        cef-pulse-auth = pulse-browser-auth;
+      };
 
   # Browser setup tool for installing extensions, configuring settings, etc.
   pulse-browser-setup = pkgs.writeShellScriptBin "pulse-browser-setup" ''
@@ -109,6 +157,64 @@ let
     install -m755 ${pkgs.replaceVars ./scripts/diagnose.sh {
       inherit (pkgs) coreutils procps iproute2 gnugrep systemd networkmanager dnsutils iputils nettools;
     }} $out/bin/diagnose-nm-pulse-vpn
+  '';
+
+  # Diagnostic dump for the browser-auth backend. Subs in the gateway hostname,
+  # proxy port, package store path, and local CA cert path so the script can
+  # check the full integration (hosts override, NAT rule, CA trust, package
+  # layout for the wrapGAppsHook regression).
+  diagnose-pulse-browser-auth = pkgs.runCommand "diagnose-pulse-browser-auth" { } ''
+    mkdir -p $out/bin
+    substitute ${./browser-auth/diagnose.sh} $out/bin/diagnose-pulse-browser-auth \
+      --subst-var-by HOSTNAME   "${gateway-hostname}" \
+      --subst-var-by PROXY_PORT "${toString cfg.browserAuthProxyPort}" \
+      --subst-var-by PKG        "${nm-pulse-sso}" \
+      --subst-var-by CA_CERT    "${browser-auth-pki}/ca.crt" \
+      --subst-var-by CERTUTIL   "${pkgs.nss.tools}/bin/certutil"
+    chmod +x $out/bin/diagnose-pulse-browser-auth
+  '';
+
+  # Per-user CA trust installer. Chrome on Linux uses NSS DB at ~/.pki/nssdb
+  # (NOT the system trust store), so security.pki.certificateFiles alone is
+  # insufficient. Also required to bypass HSTS pinning, which Chrome only
+  # waives for *locally-installed* roots (= user's NSS DB).
+  pulse-browser-auth-trust = pkgs.runCommand "pulse-browser-auth-trust" { } ''
+    mkdir -p $out/bin
+    substitute ${./browser-auth/trust-install.sh} $out/bin/pulse-browser-auth-trust \
+      --subst-var-by CA_CERT  "${browser-auth-pki}/ca.crt" \
+      --subst-var-by CERTUTIL "${pkgs.nss.tools}/bin/certutil"
+    chmod +x $out/bin/pulse-browser-auth-trust
+  '';
+
+  # Wipe all runtime state (stray proxy processes, /tmp DSID files, lingering
+  # NAT redirect, NM-cached cookie, CA trust, browser HSTS pin) so the next
+  # auth attempt starts truly fresh. Intentionally does NOT touch /etc/hosts
+  # (managed by Nix) or the /nix/store CA itself (regenerated on rebuild).
+  pulse-browser-auth-reset = pkgs.runCommand "pulse-browser-auth-reset" { } ''
+    mkdir -p $out/bin
+    substitute ${./browser-auth/reset.sh} $out/bin/pulse-browser-auth-reset \
+      --subst-var-by HOSTNAME      "${gateway-hostname}" \
+      --subst-var-by PROXY_PORT    "${toString cfg.browserAuthProxyPort}" \
+      --subst-var-by NM_CONNECTION "${cfg.vpnName}" \
+      --subst-var-by TRUST_BIN     "${pulse-browser-auth-trust}/bin/pulse-browser-auth-trust" \
+      --subst-var-by IPTABLES      "${pkgs.iptables}/bin/iptables" \
+      --subst-var-by NMCLI         "${pkgs.networkmanager}/bin/nmcli" \
+      --subst-var-by JQ            "${pkgs.jq}/bin/jq"
+    chmod +x $out/bin/pulse-browser-auth-reset
+  '';
+
+  # Fault-injection harness — simulates ungraceful tunnel death, mid-auth
+  # proxy crashes, server-side cookie expiry, post-suspend reconnect, etc.,
+  # without waiting for the real event to occur. Pure observability tool;
+  # never modifies persistent state beyond what the failures themselves do.
+  pulse-browser-auth-faultinject = pkgs.runCommand "pulse-browser-auth-faultinject" { } ''
+    mkdir -p $out/bin
+    substitute ${./browser-auth/faultinject.sh} $out/bin/pulse-browser-auth-faultinject \
+      --subst-var-by NMCLI              "${pkgs.networkmanager}/bin/nmcli" \
+      --subst-var-by JOURNALCTL         "${pkgs.systemd}/bin/journalctl" \
+      --subst-var-by NM_CONNECTION      "${cfg.vpnName}" \
+      --subst-var-by VPN_RECONNECT_UNIT "vpn-reconnect.service"
+    chmod +x $out/bin/pulse-browser-auth-faultinject
   '';
 
   # VPN reconnect script (for post-resume.target) — kills stale openconnect, triggers auto-reconnect
@@ -316,6 +422,40 @@ in
         - Easier debugging (standard Chrome)
       '';
     };
+
+    enableDesktopBrowserAuth = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = ''
+        Use the user's default browser (xdg-open) for SSO authentication.
+
+        A local HTTPS MITM proxy intercepts the DSID cookie from the VPN
+        server's Set-Cookie response header. The gateway hostname is redirected
+        to 127.0.0.1 via /etc/hosts, and iptables NAT redirects port 443 to
+        the proxy's listen port.
+
+        A local CA is generated at build time and added to the system trust
+        store so the browser accepts the proxy's TLS certificate.
+
+        Advantages over CEF/Selenium:
+        - Uses the user's real browser with all their extensions and saved passwords
+        - No extra browser runtime dependency
+        - Works with any browser the user has installed
+
+        Mutually exclusive with enableSelenium (enableDesktopBrowserAuth takes priority
+        if both are set).
+      '';
+    };
+
+    browserAuthProxyPort = lib.mkOption {
+      type = lib.types.port;
+      default = 8443;
+      description = ''
+        Local port for the MITM proxy used by the browser-auth backend.
+        Iptables redirects 127.0.0.1:443 to this port during authentication.
+        Only used when enableDesktopBrowserAuth is true.
+      '';
+    };
   };
 
   config = lib.mkIf cfg.enable {
@@ -345,7 +485,12 @@ in
       pkgs.openconnect
       nm-pulse-sso
       diagnose-nm-pulse-vpn
-    ] ++ lib.optionals (!cfg.enableSelenium) [
+    ] ++ lib.optionals cfg.enableDesktopBrowserAuth [
+      diagnose-pulse-browser-auth
+      pulse-browser-auth-trust
+      pulse-browser-auth-reset
+      pulse-browser-auth-faultinject
+    ] ++ lib.optionals (!cfg.enableSelenium && !cfg.enableDesktopBrowserAuth) [
       pulse-browser-auth
       pulse-browser-setup
       pulse-browser-reset
@@ -463,6 +608,46 @@ in
     environment.etc."NetworkManager/dispatcher.d/90-vpn-reconnect" = lib.mkIf cfg.enableRecovery {
       mode = "0755";
       source = nm-dispatcher-script;
+    };
+
+    # Browser-auth backend: trust the local CA, redirect the gateway hostname,
+    # and NAT port 443 → proxy port on loopback so the proxy can bind unprivileged.
+    security.pki.certificateFiles = lib.mkIf cfg.enableDesktopBrowserAuth [
+      "${browser-auth-pki}/ca.crt"
+    ];
+
+    networking.extraHosts = lib.mkIf cfg.enableDesktopBrowserAuth ''
+      127.0.0.1 ${gateway-hostname}
+    '';
+
+    # NAT redirect 127.0.0.1:443 → 127.0.0.1:<proxyPort> so the browser can
+    # talk to the unprivileged proxy via the standard HTTPS port.
+    #
+    # We install this via a dedicated systemd oneshot rather than
+    # networking.firewall.extraCommands because the latter is gated by
+    # networking.firewall.enable, which is commonly off on developer machines
+    # (it's off on this host). The oneshot is independent of the firewall.
+    systemd.services.nm-pulse-sso-browser-auth-redirect = lib.mkIf cfg.enableDesktopBrowserAuth {
+      description = "NAT redirect for nm-pulse-sso browser-auth proxy";
+      wantedBy   = [ "multi-user.target" ];
+      after      = [ "network-pre.target" ];
+      path       = [ pkgs.iptables ];
+      serviceConfig = {
+        Type            = "oneshot";
+        RemainAfterExit = true;
+        ExecStart = pkgs.writeShellScript "pulse-browser-auth-redirect-up" ''
+          set -eu
+          # Idempotent add: only insert if not already present.
+          iptables -t nat -C OUTPUT -d 127.0.0.1/32 -p tcp --dport 443 \
+            -j REDIRECT --to-ports ${toString cfg.browserAuthProxyPort} 2>/dev/null \
+            || iptables -t nat -A OUTPUT -d 127.0.0.1/32 -p tcp --dport 443 \
+                 -j REDIRECT --to-ports ${toString cfg.browserAuthProxyPort}
+        '';
+        ExecStop = pkgs.writeShellScript "pulse-browser-auth-redirect-down" ''
+          iptables -t nat -D OUTPUT -d 127.0.0.1/32 -p tcp --dport 443 \
+            -j REDIRECT --to-ports ${toString cfg.browserAuthProxyPort} 2>/dev/null || true
+        '';
+      };
     };
 
     # Configuration file for nm-pulse-sso-service to read runtime settings
