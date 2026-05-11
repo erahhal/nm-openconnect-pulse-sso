@@ -38,7 +38,7 @@ info "Package: $PKG"
 info "CA cert: $CA_CERT"
 
 section "Module state"
-if grep -q "enableBrowserAuth" /etc/NetworkManager/VPN/nm-pulse-sso-service.name 2>/dev/null; then
+if grep -q "enableDesktopBrowserAuth" /etc/NetworkManager/VPN/nm-pulse-sso-service.name 2>/dev/null; then
     : # not actually expected to be there, just a placeholder
 fi
 NAME_FILE=$(readlink -f /etc/NetworkManager/VPN/nm-pulse-sso-service.name 2>/dev/null)
@@ -46,7 +46,7 @@ if [[ "$NAME_FILE" == *browser-auth* ]]; then
     ok "NM plugin is browser-auth: $NAME_FILE"
 else
     err "NM plugin is NOT browser-auth (current: $NAME_FILE)"
-    info "→ enableBrowserAuth may be off, or you haven't rebuilt+switched"
+    info "→ enableDesktopBrowserAuth may be off, or you haven't rebuilt+switched"
 fi
 
 section "/etc/hosts override"

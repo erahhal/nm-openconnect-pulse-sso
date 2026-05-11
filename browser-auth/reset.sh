@@ -14,7 +14,7 @@
 #      hostname (closes the browser if needed, edits TransportSecurity, then
 #      tells the user to restart it).
 #   7. Does NOT modify /etc/hosts (managed by Nix; goes away automatically
-#      when enableBrowserAuth = false + nixos-rebuild switch).
+#      when enableDesktopBrowserAuth = false + nixos-rebuild switch).
 #   8. Does NOT delete the generated CA itself (lives in /nix/store; it's
 #      regenerated on every rebuild anyway).
 #
@@ -237,7 +237,7 @@ if [[ -x "$TRUST_BIN" ]]; then
     "$TRUST_BIN" uninstall || warn "trust uninstall returned non-zero"
 else
     warn "trust binary not on PATH ($TRUST_BIN)"
-    info "is enableBrowserAuth = true in your config?"
+    info "is enableDesktopBrowserAuth = true in your config?"
 fi
 
 # --- 6. Chrome HSTS scrub --------------------------------------------------
@@ -310,8 +310,8 @@ fi
 section "/etc/hosts"
 if grep -qE "^[[:space:]]*127\.0\.0\.1[[:space:]]+(\S+\s+)*${HOSTNAME}(\s|$)" /etc/hosts; then
     warn "/etc/hosts still maps $HOSTNAME → 127.0.0.1"
-    info "this is managed by networking.extraHosts (enableBrowserAuth = true)"
-    info "to remove: set enableBrowserAuth = false and 'sudo nixos-rebuild switch'"
+    info "this is managed by networking.extraHosts (enableDesktopBrowserAuth = true)"
+    info "to remove: set enableDesktopBrowserAuth = false and 'sudo nixos-rebuild switch'"
 else
     ok "no $HOSTNAME override present"
 fi

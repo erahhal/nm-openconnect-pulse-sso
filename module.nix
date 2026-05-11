@@ -107,7 +107,7 @@ let
   nm-pulse-sso =
     if cfg.enableSelenium then
       pkgs.callPackage ./default-selenium.nix { }
-    else if cfg.enableBrowserAuth then
+    else if cfg.enableDesktopBrowserAuth then
       pkgs.callPackage ./browser-auth/default.nix {
         cert = "${browser-auth-pki}/server.crt";
         key  = "${browser-auth-pki}/server.key";
@@ -423,7 +423,7 @@ in
       '';
     };
 
-    enableBrowserAuth = lib.mkOption {
+    enableDesktopBrowserAuth = lib.mkOption {
       type = lib.types.bool;
       default = false;
       description = ''
@@ -442,7 +442,7 @@ in
         - No extra browser runtime dependency
         - Works with any browser the user has installed
 
-        Mutually exclusive with enableSelenium (enableBrowserAuth takes priority
+        Mutually exclusive with enableSelenium (enableDesktopBrowserAuth takes priority
         if both are set).
       '';
     };
@@ -453,7 +453,7 @@ in
       description = ''
         Local port for the MITM proxy used by the browser-auth backend.
         Iptables redirects 127.0.0.1:443 to this port during authentication.
-        Only used when enableBrowserAuth is true.
+        Only used when enableDesktopBrowserAuth is true.
       '';
     };
   };
@@ -485,12 +485,12 @@ in
       pkgs.openconnect
       nm-pulse-sso
       diagnose-nm-pulse-vpn
-    ] ++ lib.optionals cfg.enableBrowserAuth [
+    ] ++ lib.optionals cfg.enableDesktopBrowserAuth [
       diagnose-pulse-browser-auth
       pulse-browser-auth-trust
       pulse-browser-auth-reset
       pulse-browser-auth-faultinject
-    ] ++ lib.optionals (!cfg.enableSelenium && !cfg.enableBrowserAuth) [
+    ] ++ lib.optionals (!cfg.enableSelenium && !cfg.enableDesktopBrowserAuth) [
       pulse-browser-auth
       pulse-browser-setup
       pulse-browser-reset
@@ -612,11 +612,11 @@ in
 
     # Browser-auth backend: trust the local CA, redirect the gateway hostname,
     # and NAT port 443 → proxy port on loopback so the proxy can bind unprivileged.
-    security.pki.certificateFiles = lib.mkIf cfg.enableBrowserAuth [
+    security.pki.certificateFiles = lib.mkIf cfg.enableDesktopBrowserAuth [
       "${browser-auth-pki}/ca.crt"
     ];
 
-    networking.extraHosts = lib.mkIf cfg.enableBrowserAuth ''
+    networking.extraHosts = lib.mkIf cfg.enableDesktopBrowserAuth ''
       127.0.0.1 ${gateway-hostname}
     '';
 
@@ -627,7 +627,7 @@ in
     # networking.firewall.extraCommands because the latter is gated by
     # networking.firewall.enable, which is commonly off on developer machines
     # (it's off on this host). The oneshot is independent of the firewall.
-    systemd.services.nm-pulse-sso-browser-auth-redirect = lib.mkIf cfg.enableBrowserAuth {
+    systemd.services.nm-pulse-sso-browser-auth-redirect = lib.mkIf cfg.enableDesktopBrowserAuth {
       description = "NAT redirect for nm-pulse-sso browser-auth proxy";
       wantedBy   = [ "multi-user.target" ];
       after      = [ "network-pre.target" ];
