@@ -50,16 +50,18 @@ let
     fi
   '';
 
-  # Wrap browser to load extensions if configured
-  pulse-browser-auth = if cfg.extensions == [] then pulse-browser-auth-base
+  # Wrap browser to load extensions and/or enable --mimic-pulse mode if configured
+  needsBrowserWrap = cfg.extensions != [] || cfg.mimicOfficialPulseCef;
+  pulse-browser-auth = if !needsBrowserWrap then pulse-browser-auth-base
     else pkgs.symlinkJoin {
-      name = "pulse-browser-auth-with-extensions";
+      name = "pulse-browser-auth-wrapped";
       paths = [ pulse-browser-auth-base ];
       nativeBuildInputs = [ pkgs.makeWrapper ];
       postBuild = ''
         wrapProgram $out/bin/pulse-browser-auth \
-          --add-flags "--extension ${lib.concatStringsSep "," cfg.extensions}" \
-          ${lib.optionalString cfg.pinExtensions "--run ${pinExtensionsScript}"}
+          ${lib.optionalString cfg.mimicOfficialPulseCef ''--add-flags "--mimic-pulse"''} \
+          ${lib.optionalString (cfg.extensions != []) ''--add-flags "--extension ${lib.concatStringsSep "," cfg.extensions}"''} \
+          ${lib.optionalString (cfg.extensions != [] && cfg.pinExtensions) "--run ${pinExtensionsScript}"}
       '';
     };
 
@@ -284,6 +286,29 @@ in
         Pin loaded extensions to the CEF browser toolbar so they are
         always visible. Requires extensions to have passthru.extensionId.
         Only effective when extensions are configured.
+      '';
+    };
+
+    mimicOfficialPulseCef = lib.mkOption {
+      type = lib.types.bool;
+      default = true;
+      description = ''
+        Configure the CEF authentication browser to present as the official
+        Pulse Secure cefBrowser. When enabled:
+
+        - Uses Chromium's auto-generated Linux user agent with a
+          "PulseWebClient/<ver>" product suffix appended, matching the
+          official client's UA signature. HTTP, navigator.userAgent, and
+          Client Hints all stay consistent, avoiding bot-detection
+          challenges ("Verify you are human") triggered by UA mismatches.
+        - Persists session cookies across runs (matches official client).
+        - Disables extensions when no extensions are configured (matches
+          official client). When extensions are configured, they are still
+          loaded.
+
+        Disable to retain the legacy Windows-then-Linux UA switching
+        behavior, which was added to bypass Okta's Linux blocking but can
+        trigger bot-detection CAPTCHAs on some SSO/IDP gateways.
       '';
     };
 

@@ -27,7 +27,17 @@ int g_timeout_seconds = 300;
 std::chrono::steady_clock::time_point g_start_time;
 CefRefPtr<CefBrowser> g_browser;
 
-// User agent switching state (for Okta bypass)
+// "Mimic Pulse" mode: present as the official Pulse Secure CEF client.
+// Sets a single Linux UA matching the official client's signature
+// ("Chrome/<ver> Safari/<ver> PulseWebClient/<ver>") via CefSettings.user_agent,
+// so HTTP and navigator.userAgent stay consistent — avoids bot-detection
+// challenges that flag the Windows-then-Linux UA mismatch.
+bool g_mimic_pulse = false;
+std::string g_mimic_pulse_ua =
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/142.0.0.0 Safari/537.36 PulseWebClient/22.8.R6.44527";
+
+// User agent switching state (legacy, non-mimic mode — for Okta bypass)
 // Start with Windows UA to bypass Okta's Linux blocking, then switch to Linux UA after first load
 std::string g_windows_ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36";
 std::string g_linux_ua = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36";
@@ -55,6 +65,13 @@ public:
         CefRefPtr<CefFrame> frame,
         CefRefPtr<CefRequest> request,
         CefRefPtr<CefCallback> callback) override {
+
+        // In mimic-pulse mode, CEF's own user_agent_product handles the UA
+        // consistently across HTTP headers, navigator.userAgent, and Client Hints.
+        // Skip per-request header rewriting to avoid introducing inconsistencies.
+        if (g_mimic_pulse) {
+            return RV_CONTINUE;
+        }
 
         CefRequest::HeaderMap headers;
         request->GetHeaderMap(headers);
@@ -150,7 +167,10 @@ public:
                    CefRefPtr<CefFrame> frame,
                    int httpStatusCode) override {
         if (frame->IsMain() && !g_found_cookie) {
-            if (!g_first_load_complete) {
+            if (g_mimic_pulse) {
+                // No UA switching in mimic mode — check for DSID cookie on every load
+                CheckAndCloseBrowser();
+            } else if (!g_first_load_complete) {
                 // First load complete with Windows UA - now switch to Linux UA and reload
                 // This bypasses Okta's initial Linux blocking while ensuring proper behavior after
                 g_first_load_complete = true;
@@ -294,6 +314,9 @@ public:
             // Load extension if specified
             if (!g_extension_path.empty()) {
                 command_line->AppendSwitchWithValue("load-extension", g_extension_path);
+            } else if (g_mimic_pulse) {
+                // Match the official Pulse client when no extensions are configured.
+                command_line->AppendSwitch("disable-extensions");
             }
         }
     }
@@ -328,13 +351,17 @@ private:
 };
 
 void PrintUsage(const char* program) {
-    std::cerr << "Usage: " << program << " --url <vpn-url> [--timeout <seconds>] [--extension <path>]" << std::endl;
+    std::cerr << "Usage: " << program << " --url <vpn-url> [--timeout <seconds>] [--extension <path>] [--mimic-pulse] [--mimic-pulse-ua <ua>]" << std::endl;
     std::cerr << std::endl;
     std::cerr << "Opens a browser window, waits for DSID cookie, outputs it." << std::endl;
     std::cerr << "Output format: DSID=<cookie-value>" << std::endl;
     std::cerr << std::endl;
     std::cerr << "Options:" << std::endl;
-    std::cerr << "  --extension <path>  Load unpacked Chrome extension from directory" << std::endl;
+    std::cerr << "  --extension <path>     Load unpacked Chrome extension from directory" << std::endl;
+    std::cerr << "  --mimic-pulse          Present as the official Pulse Secure CEF client" << std::endl;
+    std::cerr << "                         (single Linux UA with PulseWebClient suffix; no UA switching;" << std::endl;
+    std::cerr << "                         extensions disabled when none configured)" << std::endl;
+    std::cerr << "  --mimic-pulse-ua <ua>  Override the full mimic-pulse User-Agent string" << std::endl;
 }
 
 int main(int argc, char* argv[]) {
@@ -358,6 +385,10 @@ int main(int argc, char* argv[]) {
             g_timeout_seconds = std::stoi(argv[++i]);
         } else if (strcmp(argv[i], "--extension") == 0 && i + 1 < argc) {
             g_extension_path = argv[++i];
+        } else if (strcmp(argv[i], "--mimic-pulse") == 0) {
+            g_mimic_pulse = true;
+        } else if (strcmp(argv[i], "--mimic-pulse-ua") == 0 && i + 1 < argc) {
+            g_mimic_pulse_ua = argv[++i];
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             PrintUsage(argv[0]);
             return 0;
@@ -378,9 +409,21 @@ int main(int argc, char* argv[]) {
     settings.no_sandbox = true;
     settings.windowless_rendering_enabled = false;
 
-    // Set initial user agent to Windows for Okta bypass
-    // OnBeforeResourceLoad will dynamically switch to Linux UA after first page load
-    CefString(&settings.user_agent) = g_windows_ua;
+    if (g_mimic_pulse) {
+        // Mimic the official Pulse client: a single Linux UA with the
+        // "PulseWebClient/<ver>" suffix the official cefBrowser emits. Setting the
+        // full string via CefSettings.user_agent (rather than user_agent_product,
+        // which would replace the "Chrome/<ver>" portion entirely) keeps both
+        // Chrome and PulseWebClient tokens present and aligns HTTP with
+        // navigator.userAgent. Session cookies are NOT persisted here so the
+        // periodic cookie scanner can't latch onto a stale DSID from a prior run.
+        CefString(&settings.user_agent) = g_mimic_pulse_ua;
+    } else {
+        // Legacy behavior: Windows UA initially, switched to Linux after first load
+        // via OnBeforeResourceLoad. Causes a UA mismatch between HTTP and JS that
+        // some bot defenses flag; prefer --mimic-pulse for SSO gateways with CAPTCHAs.
+        CefString(&settings.user_agent) = g_windows_ua;
+    }
 
     // Set cache path for persistent cookies/sessions
     std::string cache_path = std::string(getenv("HOME") ? getenv("HOME") : "/tmp") + "/.cache/pulse-browser-auth";
