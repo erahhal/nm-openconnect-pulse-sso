@@ -10,6 +10,7 @@
   util-linux,
   systemd,
   iproute2,
+  xdg-utils,
   # Local TLS cert+key for the MITM proxy (generated in module.nix from cfg.gateway)
   cert,
   key,
@@ -76,9 +77,12 @@ stdenv.mkDerivation rec {
     makeWrapper ${pythonEnvAuth}/bin/python3 $out/bin/pulse-browser-proxy \
       --add-flags "$out/share/nm-pulse-sso-browser-auth/proxy.py"
 
+    # auth-dialog shells out to `xdg-open` to launch the user's default
+    # browser; pin xdg-utils on PATH so we don't silently rely on the host
+    # having it installed.
     wrapProgram $out/libexec/pulse-sso-auth-dialog \
       --set PYTHONHOME "${pythonEnvAuth}" \
-      --prefix PATH : "${pythonEnvAuth}/bin" \
+      --prefix PATH : "${lib.makeBinPath [ pythonEnvAuth xdg-utils ]}" \
       --add-flags "--proxy-binary $out/bin/pulse-browser-proxy" \
       --add-flags "--cert ${cert}" \
       --add-flags "--key ${key}" \
