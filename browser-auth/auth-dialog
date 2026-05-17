@@ -77,9 +77,18 @@ def wait_for_quit(timeout: int = 20):
             break
 
 
-def wait_for_proxy(port: int, timeout: float = 15.0) -> bool:
+def wait_for_proxy(proc, port: int, timeout: float = 15.0) -> bool:
+    """Wait until the proxy is listening.
+
+    Returns False if the proxy process exits before becoming ready. Without
+    this check a bare socket connect could succeed against an unrelated
+    process already holding the port (e.g. a VM port-forward) and look like
+    our proxy came up — leading us to open a browser against a dead backend.
+    """
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            return False
         try:
             s = socket.create_connection(("127.0.0.1", port), timeout=0.2)
             s.close()
@@ -163,9 +172,14 @@ def main():
         global _proxy_pid
         _proxy_pid = proxy_proc.pid
 
-        if not wait_for_proxy(args.proxy_port):
-            proxy_proc.kill()
-            print("Proxy failed to start within 15 seconds", file=sys.stderr)
+        if not wait_for_proxy(proxy_proc, args.proxy_port):
+            rc = proxy_proc.poll()
+            if rc is None:
+                proxy_proc.kill()
+                print("Proxy failed to start within 15 seconds", file=sys.stderr)
+            else:
+                print(f"Proxy exited before becoming ready (exit code {rc}) — "
+                      f"see {log_file} for details", file=sys.stderr)
             sys.exit(1)
 
         print(f"Opening browser: {gateway}", file=sys.stderr)

@@ -377,6 +377,25 @@ def main():
 
     log(f"Args: hostname={args.hostname} port={args.port} "
         f"timeout={args.timeout} quiesce={args.quiesce}")
+
+    # Bind the listening socket *first* — before DoH resolution and cert fetch.
+    # If the port is already taken (EADDRINUSE) we exit immediately, before the
+    # proxy ever looks "alive". Otherwise the auth-dialog's readiness probe
+    # could connect to the foreign listener during the DoH window and mistake
+    # it for our proxy, then open a browser against a dead backend.
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        sock.bind(("127.0.0.1", args.port))
+    except OSError as e:
+        log(f"Could not bind 127.0.0.1:{args.port}: {e}. Another process is "
+            f"holding this port — set services.nm-pulse-sso.browserAuthProxyPort "
+            f"to a free port.")
+        sys.exit(1)
+    sock.listen(20)
+    sock.settimeout(1.0)
+    log(f"Listening on 127.0.0.1:{args.port}")
+
     log(f"Resolving {args.hostname} via DoH...")
     try:
         real_ip = resolve_via_doh(args.hostname)
@@ -395,13 +414,6 @@ def main():
 
     client_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     client_ctx.load_cert_chain(args.cert, args.key)
-
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sock.bind(("127.0.0.1", args.port))
-    sock.listen(20)
-    sock.settimeout(1.0)
-    log(f"Listening on 127.0.0.1:{args.port}")
 
     state = CaptureState()
     conn_counter = itertools.count(1)
