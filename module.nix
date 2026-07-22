@@ -539,6 +539,12 @@ in
           service-type = "org.freedesktop.NetworkManager.pulse-sso";
           gateway = cfg.gateway;
           persistent = "true";  # Keep VPN alive across suspend/resume
+          # NM aborts a VPN activation after 60s by default ("connect timeout
+          # exceeded" -> Disconnect), but interactive browser auth is budgeted
+          # 310s per attempt with up to 10 attempts in one activation. The
+          # service signals its own failures, so NM's backstop only needs to
+          # catch a hung plugin — give the full auth chain room to run.
+          timeout = "3600";
         };
         ipv4.method = "auto";
         ipv6.method = "auto";

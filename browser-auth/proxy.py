@@ -153,6 +153,7 @@ class CaptureState:
         self._last_seen_monotonic: float = 0.0
         self._saw_server_error: bool = False
         self._server_error_statuses: set = set()
+        self._engaged: bool = False
 
     def record(self, dsid: str, raw_setcookie: str, request_path: str,
                response_status: str, location: str, conn_id: int):
@@ -183,6 +184,25 @@ class CaptureState:
         """True if any DSID Set-Cookie was observed, committable or not."""
         with self._lock:
             return bool(self._candidates)
+
+    def note_engaged(self, conn_id: int):
+        """Record that a client completed a TLS handshake with us.
+
+        This is the signal that the auth browser tab actually reached the
+        proxy: the auth-dialog's readiness probe is a bare TCP connect (no
+        TLS), and stray local clients that don't trust our cert abort the
+        handshake with an alert — neither counts.
+        """
+        with self._lock:
+            first = not self._engaged
+            self._engaged = True
+        if first:
+            log(f"  [c{conn_id}] first completed client TLS handshake — "
+                f"browser engaged")
+
+    def engaged(self) -> bool:
+        with self._lock:
+            return self._engaged
 
     def note_server_error(self, status: str, conn_id: int):
         """Record that the upstream gateway returned an HTTP 5xx response."""
@@ -308,6 +328,8 @@ def handle_connection(
         client_raw.close()
         return
 
+    state.note_engaged(conn_id)
+
     try:
         server_raw = socket.create_connection((real_ip, 443), timeout=30)
         server_ctx = ssl.create_default_context()
@@ -406,6 +428,14 @@ def main():
                          "(default: 3). Pulse sets a transient DSID early "
                          "in the SAML flow and updates it after the IdP "
                          "POSTs the assertion back.")
+    ap.add_argument("--engage-timeout", type=int, default=45,
+                    help="If no client completes a TLS handshake within this "
+                         "many seconds, exit with code 4 ('browser never "
+                         "engaged'). A tab killed by a network change "
+                         "(ERR_NETWORK_CHANGED) sits on an error page and "
+                         "never retries — failing fast lets the caller open "
+                         "a fresh tab instead of waiting out --timeout. "
+                         "0 disables (default: 45).")
     ap.add_argument("--log-file", default="",
                     help="Optional path to also write logs to (in addition "
                          "to stderr).")
@@ -462,10 +492,24 @@ def main():
     state = CaptureState()
     conn_counter = itertools.count(1)
     deadline = time.monotonic() + args.timeout
+    engage_deadline = (
+        time.monotonic() + args.engage_timeout
+        if args.engage_timeout > 0 else None
+    )
+    never_engaged = False
 
     while True:
         if time.monotonic() > deadline:
             log(f"Timed out after {args.timeout}s waiting for DSID.")
+            break
+
+        if (engage_deadline is not None and not state.engaged()
+                and time.monotonic() > engage_deadline):
+            log(f"No client completed a TLS handshake within "
+                f"{args.engage_timeout}s — browser never engaged (tab dead "
+                f"or never opened). Exiting early so the caller can retry "
+                f"with a fresh tab.")
+            never_engaged = True
             break
 
         # Commit once at least one DSID candidate has been seen and things
@@ -519,6 +563,11 @@ def main():
         with open(args.output, "w") as f:
             json.dump({"gwcert": gwcert, "candidates": all_seen,
                        "saw_server_error": saw_server_error}, f)
+        if never_engaged:
+            # Distinct exit code: the browser tab never reached us at all —
+            # not an auth failure. The caller retries promptly with a new tab.
+            log("No usable DSID — browser never engaged with the proxy.")
+            sys.exit(4)
         if saw_server_error:
             # Distinct exit code: the gateway is having a server-side outage,
             # not an authentication failure. The caller backs off and retries.

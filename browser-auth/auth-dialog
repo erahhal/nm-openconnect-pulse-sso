@@ -201,6 +201,16 @@ def main():
                   file=sys.stderr)
             sys.exit(3)
 
+        if proxy_proc.returncode == 4:
+            # The browser never completed a TLS handshake with the proxy —
+            # the tab died (Chromium aborts page loads on network changes)
+            # or never opened, and an error-page tab never retries on its
+            # own. Distinct exit code so the VPN service retries promptly
+            # with a fresh tab instead of waiting out the full auth window.
+            print("Browser never engaged with the auth proxy — tab dead or "
+                  "never opened", file=sys.stderr)
+            sys.exit(4)
+
         if proxy_proc.returncode != 0:
             print("Authentication failed (proxy exited with error)", file=sys.stderr)
             sys.exit(1)

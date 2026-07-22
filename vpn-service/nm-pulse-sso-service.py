@@ -1997,6 +1997,22 @@ class PulseSSOPlugin(dbus.service.Object):
                 self._schedule_direct_auth(30000)
                 return
 
+            # Exit code 4: the proxy saw no completed client TLS handshake
+            # within its engagement window — the browser tab died (Chromium
+            # aborts page loads on network changes, common right after
+            # resume) or never opened, and an error-page tab never retries
+            # on its own. The launch strategy itself worked, so don't cycle
+            # strategies or count a launch failure; retry soon with a fresh
+            # tab. Attempts stay bounded by _max_reconnection_retries in
+            # _launch_direct_auth.
+            if exit_code == 4:
+                logger.warning(
+                    "auth-dialog: browser never engaged with the auth proxy "
+                    "— retrying with a fresh browser tab"
+                )
+                self._schedule_direct_auth(3000)
+                return
+
             # Track transient vs real auth failures.
             # "Transport endpoint" and "CEF initialization failed" are system
             # readiness issues that resolve with time — don't count them toward
