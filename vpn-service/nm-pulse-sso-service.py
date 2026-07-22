@@ -252,6 +252,17 @@ class PulseSSOPlugin(dbus.service.Object):
         self._reactivation_fallback_delay_ms: int = 30_000
         self._reactivation_fallback_done: bool = False
 
+        # True while a pending re-activation timer was armed by the transport
+        # watchdog (_restart_dead_transport) rather than by a Disconnect().
+        # Disconnect() uses "re-activation already pending" as its signal that
+        # a previous Disconnect already ran, so a second one means the user
+        # wants out. The watchdog arms the timer BEFORE NM's first reactive
+        # Disconnect arrives, which would trip that heuristic and get
+        # misread as a user disconnect (cancelling reconnect and clearing
+        # secrets). This flag lets Disconnect() recognize that first
+        # reactive cleanup and keep the re-activation alive.
+        self._reactivation_armed_by_watchdog: bool = False
+
         # UUID of the VPN connection that was originally activated via
         # Connect/ConnectInteractive. Used by _reactivate_vpn_via_nm() to
         # re-activate the correct connection when duplicates exist.
@@ -508,6 +519,7 @@ class PulseSSOPlugin(dbus.service.Object):
             if self._reactivation_timeout_id is not None:
                 GLib.source_remove(self._reactivation_timeout_id)
                 self._reactivation_timeout_id = None
+            self._reactivation_armed_by_watchdog = False
 
             self._start_openconnect()
 
@@ -808,11 +820,10 @@ class PulseSSOPlugin(dbus.service.Object):
 
         Returns False so the GLib.idle_add callback does not repeat.
         """
-        # Always clear the pending flag so a later real recovery can re-arm.
-        self._transport_restart_pending = False
-
         if (self.proc is None or self.proc.pid != pid
                 or not self._openconnect_connected):
+            # Clear the pending flag so a later real flood can re-arm.
+            self._transport_restart_pending = False
             logger.info(
                 "Transport watchdog: state changed before restart "
                 "(proc=%s, connected=%s) — no action",
@@ -850,6 +861,12 @@ class PulseSSOPlugin(dbus.service.Object):
         self._reactivation_retry_count = 0
         self._reactivation_fallback_done = False
         self._is_reactivation = True
+        # NM will send its reactive Disconnect() within this window; mark the
+        # timer as watchdog-armed so Disconnect() doesn't misread that first
+        # cleanup call as a user disconnect. _transport_restart_pending stays
+        # True while the dying process's stderr keeps flooding (prevents a
+        # duplicate restart being scheduled); the next spawn resets it.
+        self._reactivation_armed_by_watchdog = True
         # Brief delay so NM observes Stopped and route changes settle before
         # we ActivateConnection.
         self._reactivation_timeout_id = GLib.timeout_add(
@@ -1042,6 +1059,9 @@ class PulseSSOPlugin(dbus.service.Object):
         Returns False to prevent GLib timeout from repeating.
         """
         self._reactivation_timeout_id = None
+        # Timer fired — the watchdog-armed window is over. Any Disconnect
+        # from here on is judged by the normal heuristics.
+        self._reactivation_armed_by_watchdog = False
 
         if self._disconnect_requested:
             logger.info("Disconnect requested during delay, aborting VPN re-activation")
@@ -2283,8 +2303,27 @@ class PulseSSOPlugin(dbus.service.Object):
         # new tunnel that NM doesn't know about → zombie VPN.
         if self.proc is None and not self._disconnect_requested:
             # If re-activation is already pending, this is a second Disconnect()
-            # call — treat as user-initiated disconnect
+            # call — treat as user-initiated disconnect. Exception: when the
+            # transport watchdog armed the timer, no Disconnect has happened
+            # yet — this is NM's FIRST, reactive cleanup after our
+            # StateChanged(Stopped), not user intent. Consume the flag and
+            # keep the re-activation alive; a genuine second Disconnect after
+            # this one is honored as a user disconnect.
             if self._reactivation_timeout_id is not None:
+                if self._reactivation_armed_by_watchdog:
+                    self._reactivation_armed_by_watchdog = False
+                    logger.info(
+                        "Disconnect during watchdog-armed re-activation — "
+                        "NM reactive cleanup, keeping re-activation scheduled"
+                    )
+                    # Re-arm so re-activation fires after NM finishes this
+                    # teardown rather than racing it.
+                    GLib.source_remove(self._reactivation_timeout_id)
+                    self._reactivation_timeout_id = GLib.timeout_add(
+                        1000, self._reactivate_vpn_via_nm
+                    )
+                    self.StateChanged(ServiceState.Stopped)
+                    return
                 logger.info("Disconnect called during pending re-activation — "
                             "treating as user disconnect")
                 GLib.source_remove(self._reactivation_timeout_id)
