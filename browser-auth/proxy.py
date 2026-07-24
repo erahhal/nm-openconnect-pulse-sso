@@ -13,10 +13,14 @@ real session DSID after the IdP POSTs the SAML assertion back. So we:
 
   1. Collect EVERY Set-Cookie: DSID=... seen, in order, with timestamp +
      the most-recent request path that triggered the response.
-  2. Once we've seen at least one DSID, wait until --quiesce seconds have
-     passed with no new DSID arriving. The latest value wins.
-  3. Drop obviously-bogus values (empty, "DELETED", obvious clear-cookie
-     patterns) — these would otherwise reset the quiesce timer for nothing.
+  2. Once we've seen at least one USABLE DSID, wait until --quiesce seconds
+     have passed with no new DSID arriving. The latest usable value wins.
+  3. Clear-cookie / placeholder values (empty, "DELETED", short tokens like
+     "DSID=1", 5xx responses) are recorded for forensics but never arm the
+     quiesce commit: the gateway DELETES the stale session cookie at the
+     START of a fresh sign-in flow (session-timeout welcome page), so
+     committing on any candidate would kill the proxy seconds into a
+     healthy re-auth.
 
 Heavy logging to stderr (always) and optionally to a file (--log-file). Every
 HTTP request line, every response status line, and every Set-Cookie header
@@ -179,11 +183,6 @@ class CaptureState:
                 if looks_like_real_dsid(c["dsid"], c["response_status"]):
                     return c
             return None
-
-    def any_dsid_seen(self) -> bool:
-        """True if any DSID Set-Cookie was observed, committable or not."""
-        with self._lock:
-            return bool(self._candidates)
 
     def note_engaged(self, conn_id: int):
         """Record that a client completed a TLS handshake with us.
@@ -512,11 +511,14 @@ def main():
             never_engaged = True
             break
 
-        # Commit once at least one DSID candidate has been seen and things
-        # have been quiet for --quiesce. We quiesce on ANY candidate (not only
-        # committable ones) so a flow that produced only a degenerate / early
-        # placeholder DSID fails fast instead of waiting out the full timeout.
-        if state.any_dsid_seen():
+        # Commit once a USABLE DSID has been seen and things have been quiet
+        # for --quiesce. Quiet time is measured from the last DSID activity
+        # of any kind, but only a committable candidate arms the commit:
+        # the gateway clears a stale cookie ("DSID=1", expires 1970) at the
+        # start of a fresh sign-in flow, and committing on that would kill
+        # the proxy while the browser is mid-flow. A flow that only ever
+        # produces degenerate DSIDs waits out --timeout instead.
+        if state.latest_committable() is not None:
             quiet_for = state.seconds_since_last_dsid()
             if quiet_for >= args.quiesce:
                 log(f"DSID activity quiesced for {quiet_for:.1f}s ≥ "

@@ -338,6 +338,10 @@ class PulseSSOPlugin(dbus.service.Object):
         self._auth_launch_commands: list = []
         self._auth_launch_index: int = 0
         self._auth_input_data: bytes = b""
+        # Proxy port baked into _auth_launch_commands. Kept separately from
+        # _proxy_nat_port (which goes None whenever the NAT rule is removed)
+        # so a strategy relaunch can reinstall the redirect for the same port.
+        self._auth_proxy_port: Optional[int] = None
 
         # Idle quit timeout — quit service if no Connect() received within 5 minutes
         # after a reactive disconnect (keeps cookie alive for external reconnect)
@@ -1709,6 +1713,7 @@ class PulseSSOPlugin(dbus.service.Object):
             # win over any pre-existing static rule for the duration of auth;
             # the rule is removed on session end (auth-dialog exit / kill).
             proxy_port = self._pick_free_port()
+            self._auth_proxy_port = proxy_port
             if not self._install_proxy_nat(proxy_port):
                 self._schedule_auth_retry("Could not install proxy NAT redirect")
                 return False
@@ -1862,6 +1867,18 @@ class PulseSSOPlugin(dbus.service.Object):
             " ".join(launch_cmd[:4]),
         )
 
+        # _on_auth_dialog_exit tears down the NAT redirect on every dialog
+        # exit — including exits that land back here to relaunch with the
+        # next strategy on the same proxy port. Without the redirect the
+        # browser can never reach the proxy, so every launch (not just the
+        # first) must make sure the rule is in place.
+        if self._proxy_nat_port is None and self._auth_proxy_port is not None:
+            if not self._install_proxy_nat(self._auth_proxy_port):
+                self._schedule_auth_retry(
+                    "Could not reinstall proxy NAT redirect"
+                )
+                return
+
         try:
             proc = subprocess.Popen(
                 launch_cmd,
@@ -1908,6 +1925,15 @@ class PulseSSOPlugin(dbus.service.Object):
         self._auth_dialog_timeout_id = None
         logger.error("Auth-dialog timed out (300s)")
         self._kill_auth_dialog()
+        # _kill_auth_dialog() cleared _auth_dialog_proc, so when the child
+        # watch fires for the process we just killed it hits the unknown-PID
+        # guard in _on_auth_dialog_exit and returns — nothing downstream
+        # schedules a retry, and the activation would sit in Starting until
+        # NM's vpn.timeout (observed: 32 min wedge, 2026-07-23). Retry here:
+        # each attempt opens a fresh browser tab, bounded by the caps in
+        # _schedule_auth_retry, which emits Failure once exhausted.
+        if self._reconnection_pending:
+            self._schedule_auth_retry("auth-dialog timed out")
         return False
 
     def _on_auth_dialog_exit(self, pid: int, status: int):
