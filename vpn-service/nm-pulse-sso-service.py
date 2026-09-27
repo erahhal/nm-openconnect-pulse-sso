@@ -382,6 +382,19 @@ class PulseSSOPlugin(dbus.service.Object):
         # each distinct outage notifies once.
         self._server_error_notified: bool = False
 
+        # Set when the next auth-dialog launch should open the portal logout
+        # URL instead of the gateway, after a previous attempt exited 5
+        # ("browser already signed in"). Cleared once that escalated attempt
+        # has been launched, so we escalate once per stale session rather
+        # than looping on the logout URL.
+        self._auth_logout_first: bool = False
+
+        # Whether the logout escalation has already been tried for the
+        # current auth cycle. If an attempt exits 5 again after a logout
+        # round-trip, logging out did not clear the session and the user has
+        # to intervene — notify instead of retrying indefinitely.
+        self._preauth_escalated: bool = False
+
         # Count system-readiness failures (D-Bus, DNS, network) separately from
         # auth failures.  These are transient and should not burn the global cap.
         self._system_not_ready_count: int = 0
@@ -430,6 +443,27 @@ class PulseSSOPlugin(dbus.service.Object):
             logger.info(
                 "PrepareForSleep: system resuming — auth-dialog launch re-enabled"
             )
+
+    def _gateway_display_host(self) -> str:
+        """Bare hostname of the gateway, for user-facing messages.
+
+        self.gateway is a full URL (https://host/realm). Falls back to a
+        generic label rather than raising: this only feeds a notification
+        string, and it must never be able to break bringing the tunnel up.
+        """
+        try:
+            gw = (self.gateway or "").strip()
+            if not gw:
+                return "the VPN"
+            host = (
+                gw.removeprefix("https://")
+                .removeprefix("http://")
+                .split("/")[0]
+                .split(":")[0]
+            )
+            return host or "the VPN"
+        except Exception:
+            return "the VPN"
 
     def _send_user_notification(self, title: str, message: str, icon: str = "network-vpn"):
         """Send a desktop notification to all logged-in users.
@@ -1691,11 +1725,27 @@ class PulseSSOPlugin(dbus.service.Object):
             # prefer native Wayland socket discovery over forcing :0.
             if session_type == "wayland":
                 if not wayland_display:
+                    # Only accept real display sockets ("wayland-<N>").
+                    # The runtime dir also holds lookalikes — "wayland-1.lock",
+                    # and other daemons' sockets such as
+                    # "wayland-1-awww-daemon.sock" — and readdir order is
+                    # arbitrary, so a bare startswith() match can hand the
+                    # auth dialog a "display" that never speaks Wayland back;
+                    # every GUI it spawns then hangs invisibly and auth times
+                    # out with no browser ever shown.
                     try:
-                        for name in os.listdir(runtime_dir):
-                            if name.startswith("wayland-"):
-                                wayland_display = name
-                                break
+                        prefix = "wayland-"
+                        candidates = [
+                            name
+                            for name in os.listdir(runtime_dir)
+                            if name.startswith(prefix)
+                            and name[len(prefix):].isdigit()
+                            and Path(runtime_dir, name).is_socket()
+                        ]
+                        if candidates:
+                            wayland_display = min(
+                                candidates, key=lambda n: int(n[len(prefix):])
+                            )
                     except Exception:
                         pass
 
@@ -1741,6 +1791,20 @@ class PulseSSOPlugin(dbus.service.Object):
             # Generate a deterministic transient-unit name for systemctl stop.
             # Each launch gets a fresh name so we can target only the current
             # unit even if a stale one was orphaned.
+            # Shared tail for every launch strategy below. --logout-first is
+            # a one-shot escalation: a previous attempt exited 5, meaning the
+            # browser is already signed in to the portal and the gateway will
+            # not mint a cookie for us. Clear the flag as soon as it is baked
+            # into the commands so the escalation happens once, not on loop.
+            dialog_args = ["--proxy-port", str(proxy_port)]
+            if self._auth_logout_first:
+                dialog_args.append("--logout-first")
+                self._auth_logout_first = False
+                logger.info(
+                    "Auth-dialog will open the portal logout URL "
+                    "(previous attempt found an existing portal session)"
+                )
+
             unit_name = f"pulse-sso-auth-{os.getpid()}-{int(time.monotonic() * 1000)}.service"
             self._auth_unit_name = unit_name
             self._auth_unit_user = user
@@ -1763,7 +1827,7 @@ class PulseSSOPlugin(dbus.service.Object):
                     *env_args,
                     "--",
                     auth_dialog,
-                    "--proxy-port", str(proxy_port),
+                    *dialog_args,
                 ],
                 # Some setups require the explicit .host suffix.
                 [
@@ -1778,7 +1842,7 @@ class PulseSSOPlugin(dbus.service.Object):
                     *env_args,
                     "--",
                     auth_dialog,
-                    "--proxy-port", str(proxy_port),
+                    *dialog_args,
                 ],
                 # Fallback: launch through the system manager as the target UID.
                 [
@@ -1792,7 +1856,7 @@ class PulseSSOPlugin(dbus.service.Object):
                     *env_args,
                     "--",
                     auth_dialog,
-                    "--proxy-port", str(proxy_port),
+                    *dialog_args,
                 ],
             ]
             self._auth_launch_index = 0
@@ -2021,6 +2085,49 @@ class PulseSSOPlugin(dbus.service.Object):
                         "VPN gateway is returning server errors — retrying",
                     )
                 self._schedule_direct_auth(30000)
+                return
+
+            # Exit code 5: the browser reached the portal already signed in,
+            # so the gateway issued no Set-Cookie: DSID — there was nothing to
+            # capture. Retrying the same URL reproduces this exactly, so
+            # escalate once to the portal logout URL, which drops the stale
+            # session and forces a full sign-in. Like exit 3/4 this is not a
+            # launch-strategy problem, so don't cycle strategies.
+            if exit_code == 5:
+                if not self._preauth_escalated:
+                    self._preauth_escalated = True
+                    self._auth_logout_first = True
+                    logger.warning(
+                        "auth-dialog: browser already signed in to the VPN "
+                        "portal — retrying via the portal logout URL to "
+                        "force a fresh session cookie"
+                    )
+                    # A browser tab is about to open on the logout URL a few
+                    # seconds from now. Unexplained, that looks like the VPN
+                    # randomly hijacking the browser — say why it is happening.
+                    self._send_user_notification(
+                        "VPN Re-Authenticating",
+                        "Your browser was still signed in to the VPN portal. "
+                        "Signing out to get a fresh session — a browser tab "
+                        "will open.",
+                    )
+                    self._schedule_direct_auth(3000)
+                else:
+                    # The logout round-trip did not clear it. Retrying again
+                    # would just burn the attempt budget silently, and this
+                    # config is used by people with no support channel — say
+                    # exactly what to do.
+                    logger.error(
+                        "auth-dialog: still signed in after opening the "
+                        "portal logout URL — manual intervention needed"
+                    )
+                    self._send_user_notification(
+                        "VPN Sign-In Needs Attention",
+                        "Your browser still has an old VPN portal session. "
+                        "Open the VPN portal, click Sign Out (or clear site "
+                        "data for the gateway), then reconnect.",
+                    )
+                    self._schedule_direct_auth(30000)
                 return
 
             # Exit code 4: the proxy saw no completed client TLS handshake
@@ -2654,6 +2761,41 @@ class PulseSSOPlugin(dbus.service.Object):
                 self.loop.quit()
                 return
 
+            # A Disconnect that lands while logind is suspending is NM
+            # tearing the tunnel down for sleep, not the user clicking
+            # Disconnect. The two are indistinguishable at this point -- same
+            # D-Bus call, same state -- so without this check the suspend path
+            # falls through to the user-disconnect branch below, which removes
+            # /run/vpn-auto-reconnect and drops the credentials. Nothing then
+            # reconnects on resume: the tunnel stays down until someone
+            # notices and reconnects by hand.
+            #
+            # Cooperate with the teardown (openconnect cannot survive the
+            # suspend anyway) but leave the auto-reconnect flag and the
+            # cached cookie alone, so the resume path can bring it back. A
+            # cookie the gateway later rejects is already handled -- that
+            # path clears it and re-authenticates.
+            if self._suspending:
+                logger.info(
+                    "Disconnect during system suspend — cooperating with "
+                    "teardown, leaving auto-reconnect flag and credentials "
+                    "for resume"
+                )
+                logger.info("Terminating openconnect process %d", self.proc.pid)
+                self.proc.terminate()
+                try:
+                    self.proc.wait(timeout=5)
+                except Exception:
+                    logger.warning("Process did not terminate, killing")
+                    self.proc.kill()
+                    self.proc.wait()
+                logger.info("openconnect exit code: %d", self.proc.returncode)
+                self.proc = None
+                self.StateChanged(ServiceState.Stopped)
+                logger.info("Stopping service event loop (system suspending)")
+                self.loop.quit()
+                return
+
             # User/NM initiated disconnect while VPN is running
             logger.info("User-initiated disconnect — removing auto-reconnect flag")
             self._disconnect_requested = True
@@ -2781,9 +2923,17 @@ class PulseSSOPlugin(dbus.service.Object):
         # per-launch quirk-rescue budget, re-arm server-error notification,
         # and clear the dead-transport watchdog (a real reconnect counts as
         # recovery; any prior burst is no longer relevant).
+        # Capture the edge before flipping: NM can call SetIp4Config more
+        # than once for a single connection, and the first-connect
+        # notification below has no other one-shot guard (the reconnect one
+        # self-clears _is_reactivation). Notifying on the transition keeps it
+        # to exactly one toast per connection.
+        was_connected = self._openconnect_connected
         self._openconnect_connected = True
         self._quirk_rescue_count = 0
         self._server_error_notified = False
+        self._auth_logout_first = False
+        self._preauth_escalated = False
         self._transport_err_first = 0.0
         self._transport_err_last = 0.0
         self._transport_err_count = 0
@@ -2851,12 +3001,20 @@ class PulseSSOPlugin(dbus.service.Object):
         except Exception:
             pass
 
-        # Notify user on re-activation (not on first connect)
+        # Notify whenever the tunnel comes up. Re-activation and first
+        # connect get distinct wording: a reconnect happened on its own and
+        # is worth flagging as such, while a first connect confirms the
+        # sign-in the user just completed.
         if self._is_reactivation:
             self._is_reactivation = False
             self._send_user_notification(
                 "VPN Reconnected",
                 "VPN auto-reconnected successfully",
+            )
+        elif not was_connected:
+            self._send_user_notification(
+                "VPN Connected",
+                f"Connected to {self._gateway_display_host()}",
             )
 
     @method(dbus_interface=NM_DBUS_INTERFACE, in_signature="a{sv}")

@@ -168,6 +168,58 @@ OpenConnect exit code 2 = auth failure. The plugin clears the cached cookie so t
    - Check systemd-run launch errors in logs
    - Verify DISPLAY or WAYLAND_DISPLAY is set in the user session
 
+### Auth times out with the browser sitting on the portal (already signed in)
+
+**Signature:** the auth window runs its full 300 s and the proxy log shows
+`Total DSID candidates seen: 0`, but the browser is visibly fine — the tab is
+on `pcs.flxvpn.net/dana/user/#` showing the Ivanti portal, already
+authenticated. Auth retries up to 10 times and every attempt looks identical.
+
+**Cause:** `browser-auth/proxy.py` can only capture the cookie from a
+`Set-Cookie: DSID=` header in a *response*. If the browser still holds a live
+portal session from earlier, the gateway considers the request authenticated,
+serves the portal directly, and never re-issues the cookie. There is nothing
+on the wire to capture, so waiting out the timeout cannot help — and neither
+can retrying the same URL, which reproduces it exactly.
+
+Note the trap: this looks like a *browser* or *transport* problem and is
+neither. Check before chasing either:
+
+```bash
+# Has openconnect even been launched? 0 = never got that far.
+journalctl --since "15 minutes ago" | grep -c "openconnect started with PID"
+
+# Is the gateway reachable right now? (bypasses /etc/hosts via the IP)
+openssl s_client -connect <gw-ip>:443 -servername pcs.flxvpn.net </dev/null 2>&1 | grep 'Verify return'
+```
+
+If openconnect never started, nothing is wrong at the tunnel layer — it is
+never reached. The proxy also re-fetches the gateway cert at the top of every
+attempt (`gwcert: sha256:…` in its log), which is itself proof the transport
+is healthy.
+
+**Handled automatically** (proxy exit code 5):
+
+- The proxy watches *request* `Cookie:` headers. A real-looking `DSID` from
+  the client, seen before the gateway has issued any `Set-Cookie: DSID`, means
+  the session predates this attempt.
+- After `--preauth-grace` (default 10 s) with **zero** `Set-Cookie: DSID` of
+  any kind, it exits 5 instead of burning the remaining ~290 s.
+- The guard is *zero candidates*, not zero committable ones, on purpose: a
+  genuine sign-in starts by **clearing** the stale cookie (`DSID=1`), which
+  lands as a candidate and proves the gateway is actively managing the
+  session. That flow must never be aborted.
+- The service escalates **once**, relaunching the dialog with `--logout-first`
+  so it opens `/dana-na/auth/logout.cgi` instead of the gateway. That drops
+  the portal session, the next load runs the full sign-in, and the gateway
+  mints a fresh DSID.
+- If an attempt exits 5 *again* after the logout round-trip, the service stops
+  retrying and notifies the user to sign out manually. Escalating on a loop
+  would silently burn the attempt budget.
+
+**Manual fix** if it ever reaches you: in the portal tab, click **Sign Out**
+(or clear site data for the gateway host), then reconnect.
+
 ### OpenConnect crashes (non-auth exit codes)
 
 1. Check the exit code:
@@ -219,6 +271,19 @@ When deeper investigation into the code is needed:
 | `scripts/vpnc/post-connect-auto-reconnect-flag.sh` | Creates /run/vpn-auto-reconnect flag on VPN connect |
 | `scripts/diagnose.sh` | What the diagnostic script checks |
 | `module.nix` | NixOS module options and what gets installed |
+
+## Auth-Dialog / Proxy Exit Codes
+
+Distinct from openconnect's. The auth-dialog passes the proxy's code through,
+and the service branches on it instead of cycling launch strategies.
+
+| Code | Meaning | Service behavior |
+|------|---------|-----------------|
+| 0 | DSID captured | Proceed to openconnect |
+| 1 | Auth failed / no usable DSID | Normal retry, cycles launch strategies |
+| 3 | Gateway returned HTTP 5xx | Server-side outage: notify once, back off 30 s |
+| 4 | Browser never engaged (dead or unopened tab) | Retry in 3 s with a fresh tab |
+| 5 | Browser already signed in; no fresh cookie issued | Escalate once to the portal logout URL; if it recurs, notify the user |
 
 ## OpenConnect Exit Codes
 

@@ -25,6 +25,12 @@ import time
 
 _proxy_pid: "int | None" = None
 
+# Ivanti Connect Secure (formerly Pulse Connect Secure) portal logout endpoint.
+# Always at the host root, independent of the realm path in the gateway URL.
+# Hitting it drops the browser's portal session so the next load runs the full
+# sign-in and the gateway issues a fresh DSID.
+LOGOUT_PATH = "/dana-na/auth/logout.cgi"
+
 
 def _terminate_handler(signum, _frame):
     global _proxy_pid
@@ -111,6 +117,15 @@ def main():
     ap.add_argument("--cert", required=True, help="Local TLS certificate (PEM)")
     ap.add_argument("--key", required=True, help="Local TLS private key (PEM)")
     ap.add_argument("--proxy-port", type=int, default=8443)
+    ap.add_argument("--logout-first", action="store_true",
+                    help="Open the gateway's portal logout URL instead of the "
+                         "gateway itself. Used when a previous attempt exited "
+                         "5 ('already signed in'): the browser holds a portal "
+                         "session the gateway considers live, so it issues no "
+                         "new DSID and there is nothing for the proxy to "
+                         "capture. Logging out drops that session, so the "
+                         "next page load runs the full sign-in and the "
+                         "gateway mints a fresh cookie.")
     args = ap.parse_args()
 
     data, secrets = read_vpn_details()
@@ -182,8 +197,17 @@ def main():
                       f"see {log_file} for details", file=sys.stderr)
             sys.exit(1)
 
-        print(f"Opening browser: {gateway}", file=sys.stderr)
-        subprocess.Popen(["xdg-open", gateway])
+        # Normally the gateway URL itself. With --logout-first, the portal
+        # logout endpoint, which lives at the host root rather than under the
+        # gateway's realm path (gateway is e.g. https://host/emp-split).
+        auth_url = gateway
+        if args.logout_first:
+            auth_url = f"https://{hostname}{LOGOUT_PATH}"
+            print("Browser holds an existing portal session — opening logout "
+                  "URL to force a fresh sign-in", file=sys.stderr)
+
+        print(f"Opening browser: {auth_url}", file=sys.stderr)
+        subprocess.Popen(["xdg-open", auth_url])
 
         try:
             proxy_proc.wait(timeout=310)
@@ -200,6 +224,15 @@ def main():
                   "server-side problem, not an authentication failure",
                   file=sys.stderr)
             sys.exit(3)
+
+        if proxy_proc.returncode == 5:
+            # The browser was already signed in to the portal, so the gateway
+            # never issued a Set-Cookie: DSID for us to capture. Distinct exit
+            # code so the VPN service can retry against the logout URL rather
+            # than reproducing the same dead end.
+            print("Browser already signed in to the VPN portal — gateway "
+                  "issued no fresh session cookie", file=sys.stderr)
+            sys.exit(5)
 
         if proxy_proc.returncode == 4:
             # The browser never completed a TLS handshake with the proxy —

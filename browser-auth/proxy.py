@@ -119,6 +119,10 @@ _DSID_RE = re.compile(rb'(?:^|[;,\s])DSID=([^;\s]*)')
 # Location header (lowercase compare since servers vary).
 _LOCATION_RE = re.compile(rb'^[Ll]ocation:[ \t]*([^\r\n]+)', re.MULTILINE)
 
+# Request Cookie header, so we can tell whether the BROWSER arrived already
+# holding a session. Distinct from _SETCOOKIE_RE, which is the server's side.
+_COOKIE_RE = re.compile(rb'^[Cc]ookie:[ \t]*([^\r\n]+)', re.MULTILINE)
+
 
 def looks_like_clear_cookie(value: str) -> bool:
     """Pulse sets DSID= or DSID=DELETED to clear; we shouldn't commit those."""
@@ -158,6 +162,8 @@ class CaptureState:
         self._saw_server_error: bool = False
         self._server_error_statuses: set = set()
         self._engaged: bool = False
+        self._client_dsid_seen: bool = False
+        self._client_dsid_monotonic: float = 0.0
 
     def record(self, dsid: str, raw_setcookie: str, request_path: str,
                response_status: str, location: str, conn_id: int):
@@ -202,6 +208,36 @@ class CaptureState:
     def engaged(self) -> bool:
         with self._lock:
             return self._engaged
+
+    def note_client_dsid(self, conn_id: int, request_path: str):
+        """Record that the CLIENT sent us a real-looking DSID cookie.
+
+        This is the positive signature of a browser that is already signed in
+        to the gateway portal. When it arrives before the gateway has issued
+        any Set-Cookie: DSID of its own, the session predates this auth
+        attempt — the gateway sees an authenticated request, has no reason to
+        mint a new cookie, and our only capture surface (Set-Cookie) stays
+        silent until the auth window times out.
+        """
+        with self._lock:
+            first = not self._client_dsid_seen
+            self._client_dsid_seen = True
+            if first:
+                self._client_dsid_monotonic = time.monotonic()
+        if first:
+            log(f"  [c{conn_id}] client presented an existing DSID cookie "
+                f"(path={request_path!r}) — browser already has a portal "
+                f"session")
+
+    def client_presented_dsid(self) -> bool:
+        with self._lock:
+            return self._client_dsid_seen
+
+    def seconds_since_client_dsid(self) -> float:
+        with self._lock:
+            if self._client_dsid_monotonic == 0.0:
+                return float("inf")
+            return time.monotonic() - self._client_dsid_monotonic
 
     def note_server_error(self, status: str, conn_id: int):
         """Record that the upstream gateway returned an HTTP 5xx response."""
@@ -302,6 +338,28 @@ def _scan_request_path_update(buf: bytes, holder: list):
         holder[0] = p
 
 
+def _scan_request_cookies(buf: bytes, conn_id: int, state: CaptureState,
+                          holder: list):
+    """Note whether the client is presenting an existing DSID session cookie.
+
+    Read-only: this never touches the bytes being relayed. We only latch a
+    flag on the shared state, which the main loop uses to tell "browser
+    arrived already signed in" apart from "user never completed the login".
+    """
+    if state.client_presented_dsid():
+        return
+    for m in _COOKIE_RE.finditer(buf):
+        dm = _DSID_RE.search(m.group(1))
+        if not dm:
+            continue
+        value = dm.group(1).decode("ascii", errors="replace")
+        # Reuse the committable-DSID test: a cleared or placeholder cookie
+        # ("DSID=", "DSID=1") is not evidence of a live portal session.
+        if looks_like_real_dsid(value, ""):
+            state.note_client_dsid(conn_id, holder[0] or "?")
+            return
+
+
 # --- core proxying ----------------------------------------------------------
 
 def handle_connection(
@@ -359,6 +417,8 @@ def handle_connection(
                 # Track most-recent request path
                 buf = (buf + data)[-_BUF_CAP:]
                 _scan_request_path_update(buf, current_req_path_holder)
+                _scan_request_cookies(buf, conn_id, state,
+                                      current_req_path_holder)
         except (ssl.SSLError, OSError) as e:
             log(f"[c{conn_id}] c→s read/write error: {e}")
         finally:
@@ -435,6 +495,15 @@ def main():
                          "never retries — failing fast lets the caller open "
                          "a fresh tab instead of waiting out --timeout. "
                          "0 disables (default: 45).")
+    ap.add_argument("--preauth-grace", type=float, default=10.0,
+                    help="If the browser presents an existing DSID cookie "
+                         "and the gateway issues no Set-Cookie: DSID of its "
+                         "own within this many seconds, exit with code 5 "
+                         "('already signed in'). The gateway has no reason "
+                         "to mint a cookie for a session that already "
+                         "exists, so waiting out --timeout cannot help; the "
+                         "caller re-opens the flow via the portal logout URL "
+                         "instead. 0 disables (default: 10).")
     ap.add_argument("--log-file", default="",
                     help="Optional path to also write logs to (in addition "
                          "to stderr).")
@@ -496,10 +565,29 @@ def main():
         if args.engage_timeout > 0 else None
     )
     never_engaged = False
+    preauthenticated = False
 
     while True:
         if time.monotonic() > deadline:
             log(f"Timed out after {args.timeout}s waiting for DSID.")
+            break
+
+        # Browser arrived already holding a portal session. The gateway will
+        # not re-issue a DSID for a session it considers live, so no
+        # Set-Cookie is coming and the full --timeout would be burned for
+        # nothing. Require a grace window with ZERO Set-Cookie: DSID of any
+        # kind: a genuine sign-in flow starts by CLEARING the stale cookie
+        # ("DSID=1"), which lands as a candidate and proves the gateway is
+        # actively managing the session.
+        if (args.preauth_grace > 0 and not preauthenticated
+                and state.client_presented_dsid()
+                and not state.all_candidates()
+                and state.seconds_since_client_dsid() >= args.preauth_grace):
+            log(f"Browser presented an existing DSID and the gateway issued "
+                f"no Set-Cookie: DSID within {args.preauth_grace}s — already "
+                f"signed in. Exiting early so the caller can re-open the "
+                f"flow through the portal logout URL.")
+            preauthenticated = True
             break
 
         if (engage_deadline is not None and not state.engaged()
@@ -564,7 +652,17 @@ def main():
         # what we did see (e.g. an HSTS-blocked browser would produce zero).
         with open(args.output, "w") as f:
             json.dump({"gwcert": gwcert, "candidates": all_seen,
-                       "saw_server_error": saw_server_error}, f)
+                       "saw_server_error": saw_server_error,
+                       "preauthenticated": preauthenticated}, f)
+        if preauthenticated:
+            # Distinct exit code: not an auth failure and not a dead tab. The
+            # browser is signed in to the portal from an earlier session, so
+            # the gateway never emits the Set-Cookie we capture on. Retrying
+            # the same URL reproduces this exactly; the caller has to break
+            # the existing session first.
+            log("No usable DSID — browser already signed in to the portal "
+                "(no fresh cookie issued).")
+            sys.exit(5)
         if never_engaged:
             # Distinct exit code: the browser tab never reached us at all —
             # not an auth failure. The caller retries promptly with a new tab.
