@@ -61,11 +61,20 @@ if [ "$nm_was_ready" != "yes" ]; then
     sleep 3
 fi
 
-# Verify a default route exists.  NM reports "connected" even when the
+# Verify an IPv4 default route exists.  NM reports "connected" even when the
 # default route is missing (e.g. after VPN teardown raced with an interface
-# change).  Without a default route, every VPN connection attempt will fail
-# immediately.  Fix by reapplying the active connection.
-HAS_DEFAULT=$(@iproute2@/bin/ip route show default 2>/dev/null | head -1)
+# change).  Without one, every VPN connection attempt will fail immediately.
+# Fix by reapplying the active connection, then bouncing it.
+#
+# The -4 is load-bearing.  `ip route show default` lists BOTH address
+# families, so a working IPv6 SLAAC default route satisfies the check while
+# IPv4 is dead — and this repair then silently skips itself.  The gateway is
+# IPv4-only, so the v4 default route is the only one that matters here.
+# Observed 2026-10-02: a dock transition left IPv4 with no address and no
+# route while IPv6 still had a default via RA.  This check passed on the
+# strength of the v6 route alone, so the repair below never ran and the
+# service went straight to five futile `nmcli connection up` attempts.
+HAS_DEFAULT=$(@iproute2@/bin/ip -4 route show default 2>/dev/null | head -1)
 if [ -z "$HAS_DEFAULT" ]; then
     echo "No default route — attempting to repair"
     for dev in $(ls /sys/class/net/ | grep -v -E "^(lo|tun|tap|docker|br-|veth|tailscale)"); do
@@ -74,7 +83,7 @@ if [ -z "$HAS_DEFAULT" ]; then
             if [ "$CARRIER" = "1" ]; then
                 @networkmanager@/bin/nmcli device reapply "$dev" 2>/dev/null || true
                 sleep 1
-                HAS_DEFAULT=$(@iproute2@/bin/ip route show default 2>/dev/null | head -1)
+                HAS_DEFAULT=$(@iproute2@/bin/ip -4 route show default 2>/dev/null | head -1)
                 if [ -z "$HAS_DEFAULT" ]; then
                     CONN=$(@networkmanager@/bin/nmcli -t -f NAME,DEVICE connection show --active 2>/dev/null | grep ":${dev}$" | head -1 | cut -d: -f1)
                     if [ -n "$CONN" ]; then

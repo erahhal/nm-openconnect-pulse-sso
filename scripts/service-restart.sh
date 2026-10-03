@@ -68,8 +68,8 @@ fi
 
 # Write cooldown file so the NM dispatcher doesn't kill openconnect
 # again when interface events fire during NM restart
-TARGET_GW=$(@iproute2@/bin/ip route show default 2>/dev/null | @gawk@/bin/awk '/via/ {print $3; exit}')
-TARGET_DEV=$(@iproute2@/bin/ip route show default 2>/dev/null | @gawk@/bin/awk '/dev/ {for(i=1;i<=NF;i++) if($i=="dev") print $(i+1); exit}')
+TARGET_GW=$(@iproute2@/bin/ip -4 route show default 2>/dev/null | @gawk@/bin/awk '/via/ {print $3; exit}')
+TARGET_DEV=$(@iproute2@/bin/ip -4 route show default 2>/dev/null | @gawk@/bin/awk '/dev/ {for(i=1;i<=NF;i++) if($i=="dev") print $(i+1); exit}')
 if [ -n "$TARGET_GW" ] && [ -n "$TARGET_DEV" ]; then
     echo "$(@coreutils@/bin/date +%s):${TARGET_GW}:${TARGET_DEV}" > /run/vpn-reconnect-last-kill
 fi

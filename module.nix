@@ -247,7 +247,7 @@ let
   # NetworkManager dispatcher script
   nm-dispatcher-script = pkgs.runCommand "nm-dispatcher" { } ''
     install -Dm755 ${pkgs.replaceVars ./scripts/nm-dispatcher.sh {
-      inherit (pkgs) procps coreutils iproute2 gawk systemd libnotify networkmanager;
+      inherit (pkgs) procps coreutils iproute2 gawk systemd libnotify;
       sudo = pkgs.sudo;
     }} $out
   '';

@@ -73,17 +73,47 @@ def log(msg: str) -> None:
 
 # --- helpers ----------------------------------------------------------------
 
+# DoH endpoints, tried in order.  The *hostname* form comes first on purpose.
+# Networks that force DNS through a local resolver normally implement it by
+# dropping port 443 to a set of well-known resolver *IP addresses*, which kills
+# the bare-IP endpoint while leaving the CDN address behind cloudflare-dns.com
+# perfectly reachable.  Resolving that hostname through the system resolver is
+# safe even though this function exists to bypass /etc/hosts: only the VPN
+# gateway's own name is pinned to 127.0.0.1 there, so ordinary names still
+# resolve normally.  The bare IP is kept as a fallback for the opposite
+# failure — a network with no usable system DNS at all.
+#
+# Why this matters: a blocked bare IP here takes out *all* authentication, and
+# the symptom points somewhere else entirely (openconnect never launches, so
+# the logs show "Creating SSL connection failed", which reads like a gateway
+# problem).  Seen 2026-10-02 on a router enforcing DNS with an exemption list
+# that covered the host's wifi address but not its dock address.
+DOH_ENDPOINTS = (
+    "https://cloudflare-dns.com/dns-query",
+    "https://1.1.1.1/dns-query",
+)
+
+
 def resolve_via_doh(hostname: str) -> str:
     """Resolve hostname via Cloudflare DoH, bypassing /etc/hosts."""
-    url = f"https://1.1.1.1/dns-query?name={hostname}&type=A"
-    req = urllib.request.Request(url, headers={"Accept": "application/dns-json"})
     ctx = ssl.create_default_context()
-    with urllib.request.urlopen(req, context=ctx, timeout=10) as resp:
-        data = json.loads(resp.read())
-    for answer in data.get("Answer", []):
-        if answer.get("type") == 1:  # A record
-            return answer["data"]
-    raise RuntimeError(f"DoH: no A record for {hostname}")
+    failures = []
+    for endpoint in DOH_ENDPOINTS:
+        url = f"{endpoint}?name={hostname}&type=A"
+        req = urllib.request.Request(url, headers={"Accept": "application/dns-json"})
+        try:
+            with urllib.request.urlopen(req, context=ctx, timeout=10) as resp:
+                data = json.loads(resp.read())
+        except Exception as e:
+            log(f"DoH endpoint {endpoint} failed: {e}")
+            failures.append(f"{endpoint}: {e}")
+            continue
+        for answer in data.get("Answer", []):
+            if answer.get("type") == 1:  # A record
+                return answer["data"]
+        log(f"DoH endpoint {endpoint} returned no A record")
+        failures.append(f"{endpoint}: no A record")
+    raise RuntimeError(f"DoH: no A record for {hostname} ({'; '.join(failures)})")
 
 
 def get_real_cert_fingerprint(hostname: str, real_ip: str) -> str:

@@ -77,7 +77,7 @@ if [ "$ACTION" = "down" ] || [ "$ACTION" = "connectivity-change" ] || [ -z "$IFA
         if [ -f "/sys/class/net/$dev/carrier" ]; then
             CARRIER=$(cat "/sys/class/net/$dev/carrier" 2>/dev/null || echo "0")
             if [ "$CARRIER" = "1" ] && [ "$dev" != "$IFACE" ]; then
-                GW=$(@iproute2@/bin/ip route show default dev "$dev" 2>/dev/null | @gawk@/bin/awk '{print $3}' | head -1)
+                GW=$(@iproute2@/bin/ip -4 route show default dev "$dev" 2>/dev/null | @gawk@/bin/awk '{print $3}' | head -1)
                 if [ -n "$GW" ]; then
                     TARGET_DEV="$dev"
                     TARGET_GW="$GW"
@@ -88,7 +88,7 @@ if [ "$ACTION" = "down" ] || [ "$ACTION" = "connectivity-change" ] || [ -z "$IFA
     done
 else
     TARGET_DEV="$IFACE"
-    TARGET_GW=$(@iproute2@/bin/ip route show default dev "$IFACE" 2>/dev/null | @gawk@/bin/awk '{print $3}' | head -1)
+    TARGET_GW=$(@iproute2@/bin/ip -4 route show default dev "$IFACE" 2>/dev/null | @gawk@/bin/awk '{print $3}' | head -1)
 fi
 
 if [ -z "$TARGET_GW" ] || [ -z "$TARGET_DEV" ]; then
@@ -121,32 +121,25 @@ if [ -z "$TARGET_GW" ] || [ -z "$TARGET_DEV" ]; then
         # Give NM time to finish VPN teardown and route cleanup
         sleep 2
 
-        # Find the active physical interface and ensure it has a default route
-        for dev in $(ls /sys/class/net/ | grep -v -E "^(lo|tun|tap|docker|br-|veth|tailscale)"); do
-            if [ -f "/sys/class/net/$dev/carrier" ]; then
-                CARRIER=$(cat "/sys/class/net/$dev/carrier" 2>/dev/null || echo "0")
-                if [ "$CARRIER" = "1" ] && [ "$dev" != "$IFACE" ]; then
-                    GW=$(@iproute2@/bin/ip route show default dev "$dev" 2>/dev/null | @gawk@/bin/awk '{print $3}' | head -1)
-                    if [ -z "$GW" ]; then
-                        log_msg "No default route on $dev after VPN teardown — reapplying connection"
-                        @networkmanager@/bin/nmcli device reapply "$dev" 2>/dev/null || true
-                        sleep 1
-                        GW=$(@iproute2@/bin/ip route show default dev "$dev" 2>/dev/null | @gawk@/bin/awk '{print $3}' | head -1)
-                        if [ -z "$GW" ]; then
-                            # Previously bounced the connection here (nmcli down/up).
-                            # That worked around an older NM/dock issue where the new
-                            # interface never finished activation, but it left NM in a
-                            # state where the VPN service's reactivation kept failing
-                            # with "base device not active" until the next interface
-                            # event — a 70+ second deadlock. The VPN service now has
-                            # a fallback retry, so let NM settle on its own.
-                            log_msg "Reapply did not restore default route — letting NM settle (VPN fallback retry will pick it up)"
-                        fi
-                    fi
-                    break
-                fi
-            fi
-        done
+        # Hand the L3 repair to vpn-auto-reconnect.service instead of doing it
+        # inline.  That service already owns exactly this: it waits for NM to
+        # settle, repairs a missing IPv4 default route, and bounces the
+        # connection when a reapply isn't enough — out of band, where it can
+        # take as long as a dock's DHCP actually needs instead of blocking a
+        # dispatcher script.
+        #
+        # This used to run `nmcli device reapply` inline, which was actively
+        # harmful.  On a dock transition this code runs a few seconds after the
+        # new interface appears, while its DHCP is still in flight, so "no
+        # default route" is the normal transient state here and not a fault.
+        # The reapply then tore down the IPv4 config NM had just committed, and
+        # because nothing ever retries a reapply, IPv4 stayed dead — no address
+        # and no default route — until the connection was bounced by hand.
+        # Observed 2026-10-02: lease at 16:03:51, address live at 16:03:54,
+        # reapply at 16:03:57, and ntpd logged the address gone after
+        # "active_time=3 secs".
+        log_msg "No gateway after $IFACE went down — handing L3 repair to vpn-auto-reconnect"
+        @systemd@/bin/systemctl restart --no-block vpn-auto-reconnect.service 2>/dev/null || true
         # Don't write cooldown file — next UP event should reconnect freely
     elif [ -n "$OPENCONNECT_PID" ] && [ "$ACTION" = "up" ]; then
         # Interface came up but has no default route yet.  This happens when

@@ -10,6 +10,11 @@ description: |
   - auth failure, cookie, DSID, SAML, SSO
   - nm-pulse-sso, pulse-browser-auth, auth-dialog
   - tun0, route, DNS, openconnect exit
+  - dock, undock, no IPv4, IP4.GATEWAY --, uncommitted DHCP lease
+  - device reapply, ip -4 route show default, IPv6 masks dead IPv4
+  - DoH, 1.1.1.1, DoH resolution failed, auth-dialog exit 1
+  - replaceVars, substituteStream, pattern doesn't match anything, @placeholder@
+  - rebuild fails after editing scripts/, unsubstituted placeholder, not found
 user-invocable: true
 allowed_tools: Bash, Read, Grep, Glob
 ---
@@ -152,6 +157,93 @@ ls -la /etc/vpnc/post-connect.d/ /etc/vpnc/reconnect.d/
    - The dispatcher skips kills for 120 seconds on the same network to prevent flapping
    - Look for "Skipping kill: last restart was" in dispatcher logs
 
+### No IPv4 after a dock/undock, and the VPN retries forever
+
+Symptom: `openconnect` exits instantly and repeatedly with `Failed to connect
+to host <gateway>` / `Creating SSL connection failed`, every ~8s, indefinitely.
+The base interface looks healthy — `nmcli` reports `connected` and `nmcli
+device show` carries a full `DHCP4.OPTION[*]` lease — but the kernel has **no
+IPv4 address and no IPv4 default route** on it, and `IP4.GATEWAY` is `--`.
+IPv6 keeps working via SLAAC + an RA default route, so anything v6-capable is
+fine and the machine only looks "partially" broken.
+
+Two separate bugs produced this. Both are fixed; check for regressions.
+
+1. **`ip route show default` lists both address families.** Every *decision*
+   about whether a route exists must use `ip -4`. The gateway is IPv4-only, so
+   a live IPv6 default route satisfies a family-agnostic check while IPv4 is
+   dead. That is what made `vpn-auto-reconnect.sh`'s route repair silently skip
+   itself and go straight to five futile `nmcli connection up` attempts.
+2. **`nmcli device reapply` is not a safe repair.** `nm-dispatcher.sh` used to
+   run it inline on an interface `down`, a few seconds after a dock's new
+   interface appeared — while that interface's DHCP was still in flight, so "no
+   default route" was the normal transient state, not a fault. The reapply tore
+   down the IPv4 config NM had *just* committed, and since nothing ever retries
+   a reapply, IPv4 stayed dead. The dispatcher now hands the repair to
+   `vpn-auto-reconnect.service`, which runs out of band, can take as long as
+   DHCP actually needs, and bounces the connection when a reapply isn't enough.
+
+Confirming it — the uncommitted lease is the giveaway:
+
+```bash
+ip -4 addr show dev <dev>; ip -4 route show default    # both empty == this bug
+nmcli device show <dev> | grep -E 'IP4.GATEWAY|DHCP4.OPTION'
+journalctl --since "30 minutes ago" | grep -E 'ntpd.*Deleting|Leaving mDNS'
+```
+
+`expiry` minus `dhcp_lease_time` tells you when the lease actually arrived. An
+address that lived only seconds (`ntpd ... active_time=3 secs`, avahi `Leaving
+mDNS multicast group ... with address`) means something tore down a *good*
+config, rather than DHCP never having finished.
+
+Manual recovery, which is also what the service now does:
+
+```bash
+CON=$(nmcli -t -g GENERAL.CONNECTION device show <dev>)
+sudo nmcli connection down "$CON" && sudo nmcli connection up "$CON"
+```
+
+Be aware that this bounce also makes NM tear down the VPN, which the plugin
+logs as `User-initiated disconnect`: it removes `/run/vpn-auto-reconnect` and
+drops the cached cookie, so the next connect needs a fresh SSO login instead of
+a silent cookie reconnect.
+
+### Auth-dialog fails after ~10s with exit 1 — DoH blocked upstream
+
+`proxy.py` resolves the gateway over **Cloudflare DoH**, not the system
+resolver, because `/etc/hosts` deliberately pins the gateway hostname to
+`127.0.0.1` so the browser reaches the local proxy. It tries `DOH_ENDPOINTS` in
+order — `cloudflare-dns.com` first, then the bare `1.1.1.1` — so a network that
+blocks resolver *IPs* no longer breaks auth on its own. If **both** are
+unreachable, authentication cannot even start:
+
+```
+Auth-dialog (attempt 1) failed (exit 1)
+# and in /tmp/pulse-dsid-*.log:
+DoH resolution failed: <urlopen error timed out>
+```
+
+Three attempts, then `Auth-dialog failed with non-transient error — stopping
+reconnection`. ICMP to 1.1.1.1 still answers, so a ping test is misleading —
+test the port, and confirm the hostname resolves fine by other means:
+
+```bash
+curl -4 -sS -o /dev/null -w '%{http_code}\n' https://1.1.1.1/   # hangs == blocked
+dig +short @<lan-resolver> <gateway-host> A                      # the IP it wanted
+```
+
+Routers that force DNS through their own resolver do exactly this, usually by
+dropping 443 to a set of known resolver addresses with a per-client exemption
+list. That used to be a single point of failure for *all* authentication,
+because the only endpoint was the bare `1.1.1.1`. The hostname endpoint added
+in front of it survives that class of block, since only the gateway hostname is
+hijacked in `/etc/hosts` — ordinary names still resolve normally.
+
+Each endpoint gets a 10s timeout, so a fully-blocked network now costs ~20s per
+auth attempt instead of 10s before failing. Read the proxy log to see which
+endpoint answered; `DoH endpoint <url> failed:` lines name each one that
+didn't.
+
 ### Authentication failure loop
 
 OpenConnect exit code 2 = auth failure. The plugin clears the cached cookie so the next `nmcli connection up` will trigger fresh browser authentication.
@@ -271,6 +363,78 @@ When deeper investigation into the code is needed:
 | `scripts/vpnc/post-connect-auto-reconnect-flag.sh` | Creates /run/vpn-auto-reconnect flag on VPN connect |
 | `scripts/diagnose.sh` | What the diagnostic script checks |
 | `module.nix` | NixOS module options and what gets installed |
+
+## Editing the shell scripts: `@placeholder@` substitution is strict
+
+Everything under `scripts/` is a **template**, not a runnable script. `module.nix`
+passes each one through `pkgs.replaceVars` with an attrset of store paths, which
+replaces `@name@` with the corresponding package. The substitution is strict in
+one direction and silent in the other, and both bite:
+
+- **A declared variable that no longer appears in the file is a build error.**
+  Removing the last use of a command breaks the build:
+
+  ```
+  substituteStream() in derivation nm-dispatcher.sh: ERROR: pattern
+  @networkmanager@ doesn't match anything in file '/nix/store/...-nm-dispatcher.sh'
+  ```
+
+  The error names only the pattern, never the fact that you deleted its last
+  call site, and it surfaces at rebuild time rather than when you edit. Hit on
+  2026-10-02 after dropping the dispatcher's only `nmcli` invocation — the fix
+  was to remove `networkmanager` from that derivation's `inherit (pkgs) ...`
+  list, since the script genuinely no longer needed it.
+
+- **A variable used in the file but *not* declared is left literal, silently.**
+  Nothing fails at build time; the installed script just contains
+  `@networkmanager@/bin/nmcli` and dies at runtime with `not found`. This is the
+  more dangerous direction, because a dispatcher hook failing this way is nearly
+  invisible — it only runs on network events.
+
+So whenever you add or remove a command invocation, update that script's
+`replaceVars` attrset in `module.nix` **in the same edit**.
+
+Check every script against its derivation, both directions, from the repo root:
+
+```bash
+python3 - <<'EOF'
+import re, pathlib
+mod = pathlib.Path("module.nix").read_text()
+pat = re.compile(r"pkgs\.replaceVars\s+\./([^\s]+)\s*\{(.*?)\n\s*\}\}", re.S)
+problems = 0
+for m in pat.finditer(mod):
+    path, body = m.group(1), m.group(2)
+    f = pathlib.Path(path)
+    if not f.exists():
+        print(f"!! {path}: missing"); problems += 1; continue
+    declared = set()
+    for inh in re.finditer(r"inherit\s*\(pkgs\)\s*([^;]+);", body):
+        declared |= set(inh.group(1).split())
+    for asg in re.finditer(r"^\s*([a-zA-Z0-9_-]+)\s*=", body, re.M):
+        declared.add(asg.group(1))
+    used = set(re.findall(r"@([a-zA-Z0-9_-]+)@", f.read_text()))
+    missing, extra = sorted(declared - used), sorted(used - declared)
+    print(f"[{'PROBLEM' if missing or extra else 'ok':7}] {path}")
+    if missing: print(f"            declared but NOT in file (build fails): {missing}")
+    if extra:   print(f"            in file but NOT declared (left literal): {extra}")
+    problems += bool(missing or extra)
+print(f"\n{problems} problem(s)")
+EOF
+```
+
+To prove one script substitutes cleanly without running a full rebuild — build
+just that derivation, mirroring its `replaceVars` call, then confirm nothing was
+left behind:
+
+```bash
+OUT=$(nix build --no-link --print-out-paths --impure --expr '
+  let pkgs = import <nixpkgs> {}; in
+  pkgs.replaceVars ./scripts/nm-dispatcher.sh {
+    inherit (pkgs) procps coreutils iproute2 gawk systemd libnotify;
+    sudo = pkgs.sudo;
+  }')
+grep -o '@[a-zA-Z0-9_-]*@' "$OUT" || echo "clean — every placeholder substituted"
+```
 
 ## Auth-Dialog / Proxy Exit Codes
 
